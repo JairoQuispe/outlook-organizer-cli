@@ -54,11 +54,23 @@ pub fn browseForFile(
             try loadDrives(allocator, &entries);
         } else {
             loadDirectory(allocator, current_dir, extension_filter, &entries) catch |err| {
+                // Mostrar error de forma persistente sin parpadeo
                 std.debug.print("\x1b[2J\x1b[H", .{});
-                std.debug.print("\x1b[31m[X]\x1b[0m  Error leyendo directorio: {s}\n", .{@errorName(err)});
-                std.debug.print("Presiona ESC para salir o cualquier tecla para continuar...\n", .{});
+                std.debug.print("\x1b[1;36m== Explorador de archivos ==\x1b[0m\n\n", .{});
+                std.debug.print("\x1b[31m[X] Error al leer el directorio:\x1b[0m\n", .{});
+                std.debug.print("    {s}\n", .{@errorName(err)});
+                std.debug.print("    \x1b[90mRuta: {s}\x1b[0m\n\n", .{current_dir});
+                std.debug.print("\x1b[33mOpciones:\x1b[0m\n", .{});
+                std.debug.print("  - Presiona \x1b[1mESC\x1b[0m para cancelar\n", .{});
+                std.debug.print("  - Presiona \x1b[1mcualquier otra tecla\x1b[0m para ir a la vista de unidades\n", .{});
+
+                // Esperar input del usuario sin loop
                 const k = keyinput.readKey();
-                if (k == .escape) return null;
+                if (k == .escape) {
+                    std.debug.print("\x1b[2J\x1b[H", .{});
+                    return null;
+                }
+
                 // Ir a drives
                 in_drives_view = true;
                 cursor = 0;

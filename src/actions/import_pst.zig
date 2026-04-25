@@ -4,6 +4,7 @@ const input = @import("../cli/input.zig");
 const menu = @import("../cli/menu.zig");
 const file_browser = @import("../cli/file_browser.zig");
 const scripts = @import("../scripts/scripts.zig");
+const import_progress = @import("import_progress.zig");
 
 /// Ejecuta el wizard de importacion de PST. Devuelve exit code del script
 /// (0 = exito) o un codigo de error del wizard.
@@ -224,23 +225,27 @@ fn executePowerShell(
         try argv.append(allocator, "-SkipDuplicates");
     }
 
-    std.debug.print("\x1b[1;36m>> Ejecutando importacion...\x1b[0m\n\n", .{});
+    try argv.append(allocator, "-Json");
 
     var child = std.process.Child.init(argv.items, allocator);
     child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
 
     child.spawn() catch |err| {
         std.debug.print("\x1b[31m[X]\x1b[0m  No se pudo iniciar PowerShell: {s}\n", .{@errorName(err)});
         return 1;
     };
 
-    const term = try child.wait();
-    const code: u8 = switch (term) {
-        .Exited => |c| @truncate(c),
-        else => 1,
+    const header = import_progress.Header{
+        .cuenta = session.email,
+        .pst_path = pst_path,
+        .action = action,
+        .filter_year = filter_year,
+        .filter_months = filter_months,
     };
+
+    const code = try import_progress.run(allocator, &child, header);
 
     std.debug.print("\n", .{});
     if (code == 0) {

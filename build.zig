@@ -16,12 +16,18 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption(bool, "embed_scripts", embed_scripts);
 
+    const zigtui_dep = b.dependency("zigtui", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
     root_mod.addOptions("build_options", build_options);
+    root_mod.addImport("zigtui", zigtui_dep.module("zigtui"));
 
     if (embed_scripts) {
         root_mod.addAnonymousImport("script_list_stores", .{

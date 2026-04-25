@@ -3,7 +3,12 @@
     .version = "0.1.0",
     .fingerprint = 0xc4cd0fd4f8e51111,
     .minimum_zig_version = "0.15.1",
-    .dependencies = .{},
+    .dependencies = .{
+        .zigtui = .{
+            .url = "git+https://github.com/adxdits/zigtui.git#a65925a2b102ba17773545dcc9228a7fc0e8121f",
+            .hash = "zigtui-0.1.0-U55PSKt3AwBIvRCiHO7utB0rZfLsTA7eF4fgHY0-K7mm",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
