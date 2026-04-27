@@ -27,7 +27,11 @@ pub fn selectStore(stores: []const Store) ?usize {
     std.debug.print("\x1b[?25l", .{});
     defer std.debug.print("\x1b[?25h", .{});
 
-    renderStores(stores, current);
+    // Imprime cabecera una sola vez; luego guarda la posicion para redibujar solo las filas
+    std.debug.print("\n\x1b[1;36mBuzones conectados a Outlook:\x1b[0m\n", .{});
+    std.debug.print("\x1b[90m(usa flechas Arriba/Abajo o numero, Enter para confirmar, ESC para cancelar)\x1b[0m\n\n", .{});
+    std.debug.print("\x1b[s", .{}); // guardar posicion del cursor (DEC SCO)
+    renderRows(stores, current);
 
     while (true) {
         const key = keyinput.readKey();
@@ -38,18 +42,17 @@ pub fn selectStore(stores: []const Store) ?usize {
                 } else {
                     current -= 1;
                 }
-                redrawStores(stores, current);
+                redrawRows(stores, current);
             },
             .arrow_down => {
                 current = (current + 1) % stores.len;
-                redrawStores(stores, current);
+                redrawRows(stores, current);
             },
             .digit => |d| {
-                // Permite 1..9 directos (los index visibles empiezan en 1)
                 const n: usize = d - '0';
                 if (n >= 1 and n <= stores.len) {
                     current = n - 1;
-                    redrawStores(stores, current);
+                    redrawRows(stores, current);
                 }
             },
             .enter => return current,
@@ -62,23 +65,21 @@ pub fn selectStore(stores: []const Store) ?usize {
 fn renderStores(stores: []const Store, selected: usize) void {
     std.debug.print("\n\x1b[1;36mBuzones conectados a Outlook:\x1b[0m\n", .{});
     std.debug.print("\x1b[90m(usa flechas Arriba/Abajo o numero, Enter para confirmar, ESC para cancelar)\x1b[0m\n\n", .{});
+    renderRows(stores, selected);
+}
 
+fn renderRows(stores: []const Store, selected: usize) void {
     for (stores, 0..) |s, i| {
         renderRow(s, i, i == selected);
     }
 }
 
-fn redrawStores(stores: []const Store, selected: usize) void {
-    // Sube N lineas (una por store) y reescribe cada una
-    const lines = stores.len;
-    // Mover cursor al inicio del bloque y limpiar cada linea
-    var idx: usize = 0;
-    while (idx < lines) : (idx += 1) {
-        std.debug.print("\x1b[1A\x1b[2K", .{});
-    }
-    for (stores, 0..) |s, i| {
-        renderRow(s, i, i == selected);
-    }
+fn redrawRows(stores: []const Store, selected: usize) void {
+    // Restaura cursor a la posicion guardada (inicio del bloque de filas)
+    // y limpia desde alli hasta el final de pantalla. Esto evita problemas
+    // con filas que hacen wrap por superar el ancho del terminal.
+    std.debug.print("\x1b[u\x1b[J", .{});
+    renderRows(stores, selected);
 }
 
 fn renderRow(s: Store, index: usize, selected: bool) void {

@@ -35,6 +35,7 @@ fn selectWithAnsi(title: []const u8, items: []const MenuItem) ?usize {
     var current: usize = 0;
     std.debug.print("\n\x1b[1;36m{s}\x1b[0m\n", .{title});
     std.debug.print("\x1b[90m(usa flechas Arriba/Abajo o numero, Enter para confirmar, ESC para cancelar)\x1b[0m\n\n", .{});
+    std.debug.print("\x1b[s", .{}); // guardar posicion del cursor para redibujar
     renderItems(items, current);
 
     while (true) {
@@ -69,10 +70,10 @@ fn renderItems(items: []const MenuItem, selected: usize) void {
 }
 
 fn redrawItems(items: []const MenuItem, selected: usize) void {
-    var idx: usize = 0;
-    while (idx < items.len) : (idx += 1) {
-        std.debug.print("\x1b[1A\x1b[2K", .{});
-    }
+    // Restaura cursor a la posicion guardada (justo antes de las filas) y
+    // limpia desde alli hasta el final de pantalla. Robusto frente a wrap
+    // de lineas largas en terminales angostos.
+    std.debug.print("\x1b[u\x1b[J", .{});
     renderItems(items, selected);
 }
 

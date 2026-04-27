@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) void {
         root_mod.addAnonymousImport("script_import_pst", .{
             .root_source_file = b.path("scripts-powershell/outlook-import-pst.ps1"),
         });
+
     }
 
     const exe = b.addExecutable(.{
