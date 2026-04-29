@@ -20,10 +20,10 @@ param (
     [switch]$SkipDuplicates,
 
     [Parameter(Mandatory=$false)]
-    [int]$ItemsPerMinute = 30,
+    [int]$ItemsPerMinute = 120,
 
     [Parameter(Mandatory=$false)]
-    [int]$BurstSize = 10,
+    [int]$BurstSize = 20,
 
     [Parameter(Mandatory=$false)]
     [int]$MaxRetries = 5,
@@ -38,11 +38,19 @@ param (
     [switch]$AdaptiveThrottling,
 
     [Parameter(Mandatory=$false)]
+    [string[]]$IncludeFolders,
+
+    [Parameter(Mandatory=$false)]
+    [switch]$ListFolders,
+
+    [Parameter(Mandatory=$false)]
     [switch]$Json,
 
     [Parameter(Mandatory=$false)]
     [switch]$Headless
 )
+
+$ErrorActionPreference = "SilentlyContinue"
 
 if ($Json -or $Headless) {
     try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
@@ -73,7 +81,11 @@ if ($Json -or $Headless) {
             [string]$Activity,
             [string]$Status,
             [int]$PercentComplete,
-            [switch]$Completed
+            [switch]$Completed,
+            [int]$Copied,
+            [int]$Moved,
+            [int]$Skipped,
+            [int]$Failed
         )
         $payload = @{
             type = "progress"
@@ -81,6 +93,10 @@ if ($Json -or $Headless) {
             status = $Status
             percent = $PercentComplete
             completed = [bool]$Completed
+            copied = $Copied
+            moved = $Moved
+            skipped = $Skipped
+            failed = $Failed
         }
         if ($Json) { Write-Output ($payload | ConvertTo-Json -Compress -Depth 6) }
     }
@@ -112,6 +128,54 @@ function Format-Bytes {
     elseif ($bytes -ge 1MB) { return "{0:N2} MB" -f ($bytes / 1MB) }
     elseif ($bytes -ge 1KB) { return "{0:N2} KB" -f ($bytes / 1KB) }
     else { return "$bytes Bytes" }
+}
+
+function Get-SafeSubject {
+    param($item)
+    try { return [string]$item.Subject } catch { return "(unknown)" }
+}
+
+function Normalize-FolderPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return "" }
+    return $Path.Trim().Replace("/", "\").Trim("\").ToLowerInvariant()
+}
+
+function Should-ProcessFolder {
+    param([string]$FolderPath, [string[]]$SelectedFolders)
+    if (-not $SelectedFolders -or $SelectedFolders.Count -eq 0) { return $true }
+    $fp = Normalize-FolderPath $FolderPath
+    foreach ($sel in $SelectedFolders) {
+        if ($fp -eq $sel -or $fp.StartsWith("$sel\")) { return $true }
+    }
+    return $false
+}
+
+function Has-SelectedDescendant {
+    param([string]$FolderPath, [string[]]$SelectedFolders)
+    if (-not $SelectedFolders -or $SelectedFolders.Count -eq 0) { return $false }
+    $fp = Normalize-FolderPath $FolderPath
+    foreach ($sel in $SelectedFolders) {
+        if ($sel.StartsWith("$fp\")) { return $true }
+    }
+    return $false
+}
+
+function Collect-PstFoldersRecursive {
+    param($folder, [string]$pathPrefix, [ref]$out)
+    try {
+        $folderPath = if ($pathPrefix) { "$pathPrefix\$($folder.Name)" } else { $folder.Name }
+        $count = 0
+        try { $count = [int]$folder.Items.Count } catch {}
+        $out.Value += [pscustomobject]@{
+            type = "folder"
+            path = $folderPath
+            itemCount = $count
+        }
+        foreach ($sub in (Get-SubFolders-Safe -parentFolder $folder)) {
+            Collect-PstFoldersRecursive -folder $sub -pathPrefix $folderPath -out $out
+        }
+    } catch {}
 }
 
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force | Out-Null
@@ -213,6 +277,17 @@ if (-not [string]::IsNullOrWhiteSpace($FilterOnlyMonths)) {
     }
 
     $FilterOnlyMonthNumbers = @($resolved | Sort-Object -Unique)
+}
+
+$SelectedFolderFilters = @()
+if ($IncludeFolders -and @($IncludeFolders).Count -gt 0) {
+    foreach ($f in $IncludeFolders) {
+        $nf = Normalize-FolderPath $f
+        if (-not [string]::IsNullOrWhiteSpace($nf)) {
+            $SelectedFolderFilters += $nf
+        }
+    }
+    $SelectedFolderFilters = @($SelectedFolderFilters | Sort-Object -Unique)
 }
 
 $script:TokenBucket = @{
@@ -355,6 +430,34 @@ function Ensure-ChildFolder {
     return $parent.Folders.Add($Name)
 }
 
+function Resolve-TargetTopFolder {
+    param(
+        $targetStore,
+        $targetRoot,
+        [string]$SourceTopName
+    )
+
+    $n = ($SourceTopName.Trim().ToLowerInvariant())
+
+    # OlDefaultFolders (valores COM)
+    # 3=DeletedItems, 4=Outbox, 5=SentMail, 6=Inbox, 16=Drafts, 23=Junk
+    if ($n -in @("bandeja de entrada", "inbox")) {
+        try { return $targetStore.GetDefaultFolder(6) } catch {}
+    } elseif ($n -in @("elementos eliminados", "deleted items")) {
+        try { return $targetStore.GetDefaultFolder(3) } catch {}
+    } elseif ($n -in @("elementos enviados", "sent items")) {
+        try { return $targetStore.GetDefaultFolder(5) } catch {}
+    } elseif ($n -in @("borradores", "drafts")) {
+        try { return $targetStore.GetDefaultFolder(16) } catch {}
+    } elseif ($n -in @("correo no deseado", "junk email")) {
+        try { return $targetStore.GetDefaultFolder(23) } catch {}
+    } elseif ($n -in @("bandeja de salida", "outbox")) {
+        try { return $targetStore.GetDefaultFolder(4) } catch {}
+    }
+
+    return Ensure-ChildFolder -parent $targetRoot -Name $SourceTopName
+}
+
 function Analyze-PstFolderRecursive {
     param($folder, [string]$pathPrefix, [ref]$totalItems, [ref]$totalBytes, [ref]$folderList)
     try {
@@ -421,6 +524,12 @@ function Restore-FolderRecursive {
     $folderPath = if ($pathPrefix) { "$pathPrefix\$($sourceFolder.Name)" } else { $sourceFolder.Name }
     $activity = if ($Action -ieq "Move") { "Moviendo" } else { "Copiando" }
 
+    $processCurrent = Should-ProcessFolder -FolderPath $folderPath -SelectedFolders $SelectedFolderFilters
+    $hasSelectedBelow = Has-SelectedDescendant -FolderPath $folderPath -SelectedFolders $SelectedFolderFilters
+    if (-not $processCurrent -and -not $hasSelectedBelow) {
+        return
+    }
+
     $dupIndex = $null
     if ($SkipDuplicates) {
         Emit-Log "info" "Indexando duplicados en: $folderPath"
@@ -433,7 +542,7 @@ function Restore-FolderRecursive {
 
     Emit-Log "info" "$activity $itemCount ítems de: $folderPath"
 
-    if ($itemCount -gt 0) {
+    if ($processCurrent -and $itemCount -gt 0) {
         for ($i = $itemCount; $i -ge 1; $i--) {
             $item = $null
             try { $item = $items.Item($i) } catch { continue }
@@ -479,11 +588,11 @@ function Restore-FolderRecursive {
                 $stats.Value.failed++
                 $stats.Value.failures += @{
                     folder = $folderPath
-                    subject = (try { $item.Subject } catch { "(unknown)" })
+                    subject = (Get-SafeSubject $item)
                     reason = "too_large"
                     sizeBytes = $itemSize
                 }
-                Emit-Log "warn" "Ítem > 150MB ignorado: $(try { $item.Subject } catch { '(unknown)' })"
+                Emit-Log "warn" "Ítem > 150MB ignorado: $(Get-SafeSubject $item)"
                 continue
             }
 
@@ -494,7 +603,12 @@ function Restore-FolderRecursive {
                     if ($Action -ieq "Move") {
                         [void]$item.Move($destFolder)
                     } else {
-                        [void]$item.Copy($destFolder)
+                        $copied = $item.Copy()
+                        if ($copied) {
+                            [void]$copied.Move($destFolder)
+                        } else {
+                            throw "No se pudo copiar el ítem."
+                        }
                     }
                 }
                 if ($Action -ieq "Move") { $stats.Value.moved++ } else { $stats.Value.copied++ }
@@ -503,7 +617,7 @@ function Restore-FolderRecursive {
                 $reason = if (Is-ThrottlingError $_) { "throttled_max_retries" } else { "error" }
                 $stats.Value.failures += @{
                     folder = $folderPath
-                    subject = (try { $item.Subject } catch { "(unknown)" })
+                    subject = (Get-SafeSubject $item)
                     reason = $reason
                     message = "$($_.Exception.Message)"
                 }
@@ -511,11 +625,13 @@ function Restore-FolderRecursive {
             }
 
             $stats.Value.processed++
+            $pct = 0
             if ($stats.Value.total -gt 0) {
                 $pct = [int][Math]::Round(($stats.Value.processed / $stats.Value.total) * 100)
                 if ($pct -gt 99 -and $stats.Value.processed -lt $stats.Value.total) { $pct = 99 }
-                Write-Progress -Activity "Restauración PST → Buzón" -Status "$folderPath ($($stats.Value.processed)/$($stats.Value.total))" -PercentComplete $pct
+                if ($pct -eq 0 -and $stats.Value.processed -gt 0) { $pct = 1 }
             }
+            Write-Progress -Activity "Restauracion PST -> Buzon" -Status "$folderPath ($($stats.Value.processed)/$($stats.Value.total))" -PercentComplete $pct -Copied $stats.Value.copied -Moved $stats.Value.moved -Skipped $stats.Value.skipped -Failed $stats.Value.failed
 
             Emit-ThrottleStats
         }
@@ -528,17 +644,9 @@ function Restore-FolderRecursive {
 }
 
 if (-not $PstPath) { Emit-ErrorPayload "Se requiere -PstPath."; exit 1 }
-if (-not $TargetStoreId) { Emit-ErrorPayload "Se requiere -TargetStoreId."; exit 1 }
 if (-not (Test-Path $PstPath)) { Emit-ErrorPayload "PST no encontrado: $PstPath"; exit 1 }
 
 $namespace = Get-OutlookNamespace
-
-$targetStore = Get-StoreByIdOrPath -namespace $namespace -StoreId $TargetStoreId
-if (-not $targetStore) {
-    Emit-ErrorPayload "No se encontró el buzón destino (StoreId=$TargetStoreId)."
-    exit 1
-}
-Emit-Log "info" "Buzón destino: $($targetStore.DisplayName)"
 
 $alreadyMounted = $false
 $pstStore = Get-StoreByIdOrPath -namespace $namespace -FilePath $PstPath
@@ -557,6 +665,34 @@ if ($pstStore) {
         exit 1
     }
 }
+
+$pstRoot = $pstStore.GetRootFolder()
+
+if ($ListFolders) {
+    $flat = [ref]@()
+    foreach ($tf in (Get-SubFolders-Safe -parentFolder $pstRoot)) {
+        Collect-PstFoldersRecursive -folder $tf -pathPrefix "" -out $flat
+    }
+
+    Write-Output (@{ type = "folders"; count = @($flat.Value).Count } | ConvertTo-Json -Compress -Depth 6)
+    foreach ($f in $flat.Value) {
+        Write-Output ($f | ConvertTo-Json -Compress -Depth 6)
+    }
+
+    if (-not $alreadyMounted) {
+        try { $namespace.RemoveStore($pstRoot) } catch {}
+    }
+    exit 0
+}
+
+if (-not $TargetStoreId) { Emit-ErrorPayload "Se requiere -TargetStoreId."; exit 1 }
+
+$targetStore = Get-StoreByIdOrPath -namespace $namespace -StoreId $TargetStoreId
+if (-not $targetStore) {
+    Emit-ErrorPayload "No se encontró el buzón destino (StoreId=$TargetStoreId)."
+    exit 1
+}
+Emit-Log "info" "Buzón destino: $($targetStore.DisplayName)"
 
 Emit-Log "info" "Contando ítems del PST (para progreso)..."
 $totalItems = [ref]0
@@ -582,11 +718,11 @@ $startTime = [DateTime]::UtcNow
 $targetRoot = $targetStore.GetRootFolder()
 
 foreach ($sourceTop in (Get-SubFolders-Safe -parentFolder $pstRoot)) {
-    $destTop = Ensure-ChildFolder -parent $targetRoot -Name $sourceTop.Name
+    $destTop = Resolve-TargetTopFolder -targetStore $targetStore -targetRoot $targetRoot -SourceTopName $sourceTop.Name
     Restore-FolderRecursive -sourceFolder $sourceTop -destFolder $destTop -pathPrefix "" -stats $stats
 }
 
-Write-Progress -Activity "Restauración PST → Buzón" -Status "Completado" -PercentComplete 100 -Completed
+Write-Progress -Activity "Restauracion PST -> Buzon" -Status "Completado" -PercentComplete 100 -Completed -Copied $stats.Value.copied -Moved $stats.Value.moved -Skipped $stats.Value.skipped -Failed $stats.Value.failed
 Emit-ThrottleStats -Force
 
 if (-not $alreadyMounted) {

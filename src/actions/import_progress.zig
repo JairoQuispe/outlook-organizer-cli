@@ -262,6 +262,10 @@ fn parseAndApply(line: []const u8, state: *State, allocator: std.mem.Allocator) 
         if (strField(root, "activity")) |a| state.setActivity(a);
         if (strField(root, "status")) |s| state.setStatus(s);
         if (intField(root, "percent")) |p| state.percent = @intCast(@max(0, @min(100, p)));
+        if (intField(root, "copied")) |v| state.copied = @intCast(@max(0, v));
+        if (intField(root, "moved")) |v| state.moved = @intCast(@max(0, v));
+        if (intField(root, "skipped")) |v| state.skipped = @intCast(@max(0, v));
+        if (intField(root, "failed")) |v| state.failed = @intCast(@max(0, v));
     } else if (std.mem.eql(u8, type_str, "throttleStats")) {
         if (floatField(root, "effectiveRate")) |r| state.throttle_rate = r;
         if (intField(root, "totalWaitedMs")) |w| state.throttle_waited_ms = @intCast(@max(0, w));

@@ -41,7 +41,12 @@ pub fn fetchStores(parent_allocator: std.mem.Allocator, script_path: []const u8)
     defer parent_allocator.free(result.stderr);
 
     switch (result.term) {
-        .Exited => |code| if (code != 0) return error.ScriptFailed,
+        .Exited => |code| if (code != 0) {
+            if (result.stderr.len > 0) {
+                std.debug.print("\n\x1b[31mError del script PowerShell:\x1b[0m\n{s}\n", .{result.stderr});
+            }
+            return error.ScriptFailed;
+        },
         else => return error.ScriptFailed,
     }
 

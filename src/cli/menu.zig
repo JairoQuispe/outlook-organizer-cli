@@ -23,6 +23,110 @@ pub fn select(title: []const u8, items: []const MenuItem) ?usize {
     return selectWithAnsi(title, items);
 }
 
+/// Muestra un menu interactivo multi-seleccion y devuelve los indices elegidos.
+/// Teclas: Arriba/Abajo mover, Espacio toggle, A seleccionar todos,
+/// N limpiar seleccion, Enter confirmar, ESC cancelar.
+pub fn selectMultiple(allocator: std.mem.Allocator, title: []const u8, items: []const MenuItem) !?[]usize {
+    if (items.len == 0) return null;
+
+    const keyinput = @import("../windows/keyinput.zig");
+    var selected = try allocator.alloc(bool, items.len);
+    errdefer allocator.free(selected);
+    @memset(selected, false);
+
+    var raw = keyinput.RawMode.enter();
+    defer raw.leave();
+
+    std.debug.print("\x1b[?25l", .{});
+    defer std.debug.print("\x1b[?25h", .{});
+
+    var current: usize = 0;
+    std.debug.print("\n\x1b[1;36m{s}\x1b[0m\n", .{title});
+    std.debug.print("\x1b[90m(Arriba/Abajo, Espacio=marcar, A=todos, N=ninguno, Enter=confirmar, ESC=cancelar)\x1b[0m\n\n", .{});
+    renderMultiItems(items, selected, current);
+
+    while (true) {
+        const key = keyinput.readKey();
+        switch (key) {
+            .arrow_up => {
+                current = if (current == 0) items.len - 1 else current - 1;
+                redrawMultiItems(items, selected, current);
+            },
+            .arrow_down => {
+                current = (current + 1) % items.len;
+                redrawMultiItems(items, selected, current);
+            },
+            .digit => |d| {
+                const n: usize = d - '0';
+                if (n >= 1 and n <= items.len) {
+                    current = n - 1;
+                    selected[current] = !selected[current];
+                    redrawMultiItems(items, selected, current);
+                }
+            },
+            .char => |c| {
+                switch (c) {
+                    ' ' => {
+                        selected[current] = !selected[current];
+                        redrawMultiItems(items, selected, current);
+                    },
+                    'a', 'A' => {
+                        @memset(selected, true);
+                        redrawMultiItems(items, selected, current);
+                    },
+                    'n', 'N' => {
+                        @memset(selected, false);
+                        redrawMultiItems(items, selected, current);
+                    },
+                    else => {},
+                }
+            },
+            .enter => {
+                var count: usize = 0;
+                for (selected) |s| {
+                    if (s) count += 1;
+                }
+                if (count == 0) {
+                    continue;
+                }
+                var out = try allocator.alloc(usize, count);
+                var j: usize = 0;
+                for (selected, 0..) |s, i| {
+                    if (s) {
+                        out[j] = i;
+                        j += 1;
+                    }
+                }
+                allocator.free(selected);
+                return out;
+            },
+            .escape => {
+                allocator.free(selected);
+                return null;
+            },
+            else => {},
+        }
+    }
+}
+
+fn renderMultiRow(item: MenuItem, index: usize, checked: bool, current: bool) void {
+    const num = index + 1;
+    const mark: []const u8 = if (checked) "X" else " ";
+    if (current) {
+        if (item.description) |d| {
+            std.debug.print("\x1b[1;42;30m > [{d}] [{s}] {s}\x1b[0m  \x1b[90m{s}\x1b[0m\n", .{ num, mark, item.label, d });
+        } else {
+            std.debug.print("\x1b[1;42;30m > [{d}] [{s}] {s}\x1b[0m\n", .{ num, mark, item.label });
+        }
+    } else {
+        if (item.description) |d| {
+            std.debug.print("   [{d}] [{s}] {s}  \x1b[90m{s}\x1b[0m\n", .{ num, mark, item.label, d });
+        } else {
+            std.debug.print("   [{d}] [{s}] {s}\n", .{ num, mark, item.label });
+        }
+    }
+}
+
 fn selectWithAnsi(title: []const u8, items: []const MenuItem) ?usize {
     const keyinput = @import("../windows/keyinput.zig");
 
@@ -35,7 +139,6 @@ fn selectWithAnsi(title: []const u8, items: []const MenuItem) ?usize {
     var current: usize = 0;
     std.debug.print("\n\x1b[1;36m{s}\x1b[0m\n", .{title});
     std.debug.print("\x1b[90m(usa flechas Arriba/Abajo o numero, Enter para confirmar, ESC para cancelar)\x1b[0m\n\n", .{});
-    std.debug.print("\x1b[s", .{}); // guardar posicion del cursor para redibujar
     renderItems(items, current);
 
     while (true) {
@@ -69,12 +172,21 @@ fn renderItems(items: []const MenuItem, selected: usize) void {
     }
 }
 
+fn renderMultiItems(items: []const MenuItem, selected_map: []const bool, current: usize) void {
+    for (items, 0..) |item, i| {
+        renderMultiRow(item, i, selected_map[i], i == current);
+    }
+}
+
 fn redrawItems(items: []const MenuItem, selected: usize) void {
-    // Restaura cursor a la posicion guardada (justo antes de las filas) y
-    // limpia desde alli hasta el final de pantalla. Robusto frente a wrap
-    // de lineas largas en terminales angostos.
-    std.debug.print("\x1b[u\x1b[J", .{});
+    // Mueve el cursor hacia arriba N lineas y limpia desde alli
+    std.debug.print("\x1b[{d}A\x1b[J", .{items.len});
     renderItems(items, selected);
+}
+
+fn redrawMultiItems(items: []const MenuItem, selected_map: []const bool, current: usize) void {
+    std.debug.print("\x1b[{d}A\x1b[J", .{items.len});
+    renderMultiItems(items, selected_map, current);
 }
 
 fn renderRow(item: MenuItem, index: usize, selected: bool) void {

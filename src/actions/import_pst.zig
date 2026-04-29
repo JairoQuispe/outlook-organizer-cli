@@ -6,6 +6,11 @@ const file_browser = @import("../cli/file_browser.zig");
 const scripts = @import("../scripts/scripts.zig");
 const import_progress = @import("import_progress.zig");
 
+const PstFolder = struct {
+    path: []u8,
+    item_count: usize,
+};
+
 /// Ejecuta el wizard de importacion de PST. Devuelve exit code del script
 /// (0 = exito) o un codigo de error del wizard.
 pub fn run(session: Session, allocator: std.mem.Allocator) !u8 {
@@ -17,35 +22,154 @@ pub fn run(session: Session, allocator: std.mem.Allocator) !u8 {
     const pst_path = try askPstPath(allocator);
     defer allocator.free(pst_path);
 
-    // 2) Accion Copy / Move
+    // 2) Seleccion de carpetas del PST (multi-seleccion)
+    const selected_folders = try askPstFolders(allocator, pst_path);
+    defer {
+        for (selected_folders) |p| allocator.free(p);
+        allocator.free(selected_folders);
+    }
+
+    // 3) Accion Copy / Move
     const action = askAction() orelse {
         std.debug.print("\n\x1b[33m[!] Importacion cancelada.\x1b[0m\n", .{});
         return 2;
     };
 
-    // 3) Filtro por anio
+    // 4) Filtro por anio
     const filter_year = try askFilterYear(allocator);
     defer if (filter_year) |fy| allocator.free(fy);
 
-    // 4) Filtro por meses (solo si hay anio)
+    // 5) Filtro por meses (solo si hay anio)
     var filter_months: ?[]u8 = null;
     defer if (filter_months) |fm| allocator.free(fm);
     if (filter_year != null) {
         filter_months = try askFilterMonths(allocator);
     }
 
-    // 5) Saltar duplicados
-    const skip_dupes = input.confirm("\xc2\xbfSaltar duplicados (por Message-Id)?", true);
+    // 6) Saltar duplicados
+    const skip_dupes = input.confirm("\xc2\xbfSaltar duplicados (por Message-Id)?", false);
 
-    // 6) Resumen y confirmacion
-    printSummary(session, pst_path, action, filter_year, filter_months, skip_dupes);
+    // 7) Resumen y confirmacion
+    printSummary(session, pst_path, selected_folders, action, filter_year, filter_months, skip_dupes);
     if (!input.confirm("\xc2\xbfEjecutar la importacion con estos parametros?", true)) {
         std.debug.print("\n\x1b[33m[!] Importacion cancelada.\x1b[0m\n", .{});
         return 2;
     }
 
-    // 7) Ejecutar PowerShell heredando stdio para ver progreso
-    return try executePowerShell(allocator, session, pst_path, action, filter_year, filter_months, skip_dupes);
+    // 8) Ejecutar PowerShell heredando stdio para ver progreso
+    return try executePowerShell(allocator, session, pst_path, selected_folders, action, filter_year, filter_months, skip_dupes);
+}
+
+fn askPstFolders(allocator: std.mem.Allocator, pst_path: []const u8) ![][]u8 {
+    const folders = try listPstFolders(allocator, pst_path);
+    defer {
+        for (folders) |f| allocator.free(f.path);
+        allocator.free(folders);
+    }
+
+    if (folders.len == 0) {
+        std.debug.print("\x1b[31m[X]\x1b[0m  El PST no contiene carpetas importables.\n", .{});
+        return error.NoFoldersFound;
+    }
+
+    var items = try allocator.alloc(menu.MenuItem, folders.len);
+    defer allocator.free(items);
+
+    var descriptions = try allocator.alloc(?[]u8, folders.len);
+    defer {
+        for (descriptions) |d_opt| {
+            if (d_opt) |d| allocator.free(d);
+        }
+        allocator.free(descriptions);
+    }
+
+    for (folders, 0..) |f, i| {
+        const desc = try std.fmt.allocPrint(allocator, "{d} correo(s)", .{f.item_count});
+        descriptions[i] = desc;
+        items[i] = .{ .label = f.path, .description = desc };
+    }
+
+    const idxs = try menu.selectMultiple(allocator, "Selecciona carpetas del PST a importar", items) orelse {
+        return error.UserCancelled;
+    };
+    defer allocator.free(idxs);
+
+    var out = try allocator.alloc([]u8, idxs.len);
+    errdefer {
+        for (out[0..]) |p| allocator.free(p);
+        allocator.free(out);
+    }
+    for (idxs, 0..) |idx, j| {
+        out[j] = try allocator.dupe(u8, folders[idx].path);
+    }
+    return out;
+}
+
+fn listPstFolders(allocator: std.mem.Allocator, pst_path: []const u8) ![]PstFolder {
+    const script_path = try scripts.getScriptPath(allocator, .import_pst);
+    defer allocator.free(script_path);
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script_path,
+            "-PstPath",
+            pst_path,
+            "-ListFolders",
+            "-Json",
+        },
+        .max_output_bytes = 8 * 1024 * 1024,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| if (code != 0) {
+            if (result.stderr.len > 0) {
+                std.debug.print("\n\x1b[31mError listando carpetas PST:\x1b[0m\n{s}\n", .{result.stderr});
+            }
+            return error.ListFoldersFailed;
+        },
+        else => return error.ListFoldersFailed,
+    }
+
+    var list = std.ArrayList(PstFolder){};
+    defer list.deinit(allocator);
+
+    var it = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \r\n\t");
+        if (trimmed.len == 0 or trimmed[0] != '{') continue;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+        const obj = parsed.value.object;
+
+        const type_val = obj.get("type") orelse continue;
+        if (type_val != .string or !std.mem.eql(u8, type_val.string, "folder")) continue;
+
+        const path_val = obj.get("path") orelse continue;
+        if (path_val != .string) continue;
+        const count_val = obj.get("itemCount");
+        const count: usize = if (count_val) |v| switch (v) {
+            .integer => |i| if (i > 0) @intCast(i) else 0,
+            .float => |f| if (f > 0) @intFromFloat(f) else 0,
+            else => 0,
+        } else 0;
+
+        try list.append(allocator, .{
+            .path = try allocator.dupe(u8, path_val.string),
+            .item_count = count,
+        });
+    }
+
+    return try list.toOwnedSlice(allocator);
 }
 
 fn askPstPath(allocator: std.mem.Allocator) ![]u8 {
@@ -158,6 +282,7 @@ fn askFilterMonths(allocator: std.mem.Allocator) !?[]u8 {
 fn printSummary(
     session: Session,
     pst_path: []const u8,
+    selected_folders: []const []const u8,
     action: []const u8,
     filter_year: ?[]const u8,
     filter_months: ?[]const u8,
@@ -167,6 +292,7 @@ fn printSummary(
     std.debug.print("  \x1b[90mCuenta destino:\x1b[0m    \x1b[1m{s}\x1b[0m\n", .{session.email});
     std.debug.print("  \x1b[90mStoreId:\x1b[0m           {s}\n", .{session.store_id});
     std.debug.print("  \x1b[90mArchivo PST:\x1b[0m       {s}\n", .{pst_path});
+    std.debug.print("  \x1b[90mCarpetas PST:\x1b[0m      {d} seleccionada(s)\n", .{selected_folders.len});
     std.debug.print("  \x1b[90mAccion:\x1b[0m            {s}\n", .{action});
     if (filter_year) |fy| {
         std.debug.print("  \x1b[90mFiltro anio:\x1b[0m       {s}\n", .{fy});
@@ -186,6 +312,7 @@ fn executePowerShell(
     allocator: std.mem.Allocator,
     session: Session,
     pst_path: []const u8,
+    selected_folders: []const []const u8,
     action: []const u8,
     filter_year: ?[]const u8,
     filter_months: ?[]const u8,
@@ -212,6 +339,11 @@ fn executePowerShell(
 
     try argv.append(allocator, "-Action");
     try argv.append(allocator, action);
+
+    for (selected_folders) |folder_path| {
+        try argv.append(allocator, "-IncludeFolders");
+        try argv.append(allocator, folder_path);
+    }
 
     if (filter_year) |fy| {
         try argv.append(allocator, "-FilterOnlyYear");

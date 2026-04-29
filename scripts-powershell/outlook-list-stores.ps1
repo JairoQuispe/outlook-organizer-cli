@@ -102,19 +102,37 @@ if ($MyInvocation.InvocationName -ne ".") {
     try {
         $outlook = $null
         $namespace = $null
+        $maxRetries = 3
+        $retryDelay = 2
 
-        try {
-            $outlook = [System.Runtime.InteropServices.Marshal]::GetActiveObject("Outlook.Application")
-            $namespace = $outlook.GetNamespace("MAPI")
-            try { $namespace.Logon("", "", $false, $false) } catch {}
-        } catch {
-            $outlook = New-Object -ComObject Outlook.Application
-            $namespace = $outlook.GetNamespace("MAPI")
-            try { $namespace.Logon("", "", $false, $true) } catch {}
-        }
+        for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+            try {
+                try {
+                    $outlook = [System.Runtime.InteropServices.Marshal]::GetActiveObject("Outlook.Application")
+                    $namespace = $outlook.GetNamespace("MAPI")
+                    try { $namespace.Logon("", "", $false, $false) } catch {}
+                } catch {
+                    $outlook = New-Object -ComObject Outlook.Application
+                    $namespace = $outlook.GetNamespace("MAPI")
+                    try { $namespace.Logon("", "", $false, $true) } catch {}
+                }
 
-        if (-not $namespace) {
-            throw "No se pudo obtener el Namespace MAPI de Outlook."
+                if (-not $namespace) {
+                    throw "No se pudo obtener el Namespace MAPI de Outlook."
+                }
+
+                break
+            } catch {
+                $errorCode = $_.Exception.HResult
+                if ($errorCode -eq 0xCC54011D -or $errorCode -eq -864313571) {
+                    if ($attempt -lt $maxRetries) {
+                        Write-Warning "Outlook ocupado (intento $attempt/$maxRetries). Reintentando en $retryDelay segundos..."
+                        Start-Sleep -Seconds $retryDelay
+                        continue
+                    }
+                }
+                throw
+            }
         }
 
         $stores = Get-ConnectedOutlookStores -namespace $namespace
