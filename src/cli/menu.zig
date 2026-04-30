@@ -113,17 +113,15 @@ fn renderMultiRow(item: MenuItem, index: usize, checked: bool, current: bool) vo
     const num = index + 1;
     const mark: []const u8 = if (checked) "X" else " ";
     if (current) {
-        if (item.description) |d| {
-            std.debug.print("\x1b[1;42;30m > [{d}] [{s}] {s}\x1b[0m  \x1b[90m{s}\x1b[0m\n", .{ num, mark, item.label, d });
-        } else {
-            std.debug.print("\x1b[1;42;30m > [{d}] [{s}] {s}\x1b[0m\n", .{ num, mark, item.label });
-        }
+        std.debug.print("\x1b[1;42;30m > [{d}] [{s}] {s}\x1b[0m\n", .{ num, mark, item.label });
     } else {
-        if (item.description) |d| {
-            std.debug.print("   [{d}] [{s}] {s}  \x1b[90m{s}\x1b[0m\n", .{ num, mark, item.label, d });
-        } else {
-            std.debug.print("   [{d}] [{s}] {s}\n", .{ num, mark, item.label });
-        }
+        std.debug.print("   [{d}] [{s}] {s}\n", .{ num, mark, item.label });
+    }
+
+    if (item.description) |d| {
+        std.debug.print("      \x1b[90m{s}\x1b[0m\n", .{d});
+    } else {
+        std.debug.print("\n", .{});
     }
 }
 
@@ -185,7 +183,7 @@ fn redrawItems(items: []const MenuItem, selected: usize) void {
 }
 
 fn redrawMultiItems(items: []const MenuItem, selected_map: []const bool, current: usize) void {
-    std.debug.print("\x1b[{d}A\x1b[J", .{items.len});
+    std.debug.print("\x1b[{d}A\x1b[J", .{items.len * 2});
     renderMultiItems(items, selected_map, current);
 }
 

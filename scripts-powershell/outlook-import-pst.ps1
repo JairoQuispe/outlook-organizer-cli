@@ -166,11 +166,91 @@ function Collect-PstFoldersRecursive {
     try {
         $folderPath = if ($pathPrefix) { "$pathPrefix\$($folder.Name)" } else { $folder.Name }
         $count = 0
-        try { $count = [int]$folder.Items.Count } catch {}
+        $yearCounts = @{}
+        $usedTable = $false
+        try {
+            $table = $folder.GetTable("")
+            $table.Columns.RemoveAll()
+            $table.Columns.Add("ReceivedTime") | Out-Null
+            $table.Columns.Add("CreationTime") | Out-Null
+            try { $table.Columns.Add("SentOn") | Out-Null } catch {}
+            try { $table.Columns.Add("LastModificationTime") | Out-Null } catch {}
+
+            while (-not $table.EndOfTable) {
+                $rows = $table.GetNextRows(300)
+                foreach ($row in $rows) {
+                    $count++
+                    $d = $row["ReceivedTime"]
+                    if (-not $d) { $d = $row["CreationTime"] }
+                    if (-not $d) {
+                        try { $d = $row["SentOn"] } catch {}
+                    }
+                    if (-not $d) {
+                        try { $d = $row["LastModificationTime"] } catch {}
+                    }
+                    if ($d) {
+                        $y = [int]$d.Year
+                        if ($yearCounts.ContainsKey($y)) {
+                            $yearCounts[$y]++
+                        } else {
+                            $yearCounts[$y] = 1
+                        }
+                    }
+                }
+            }
+            $usedTable = $true
+        } catch {
+            try {
+                $count = [int]$folder.Items.Count
+            } catch {}
+        }
+
+        if (-not $usedTable) {
+            try {
+                foreach ($item in $folder.Items) {
+                    $d = $null
+                    try { $d = $item.ReceivedTime } catch {}
+                    if (-not $d) {
+                        try { $d = $item.CreationTime } catch {}
+                    }
+                    if (-not $d) {
+                        try { $d = $item.SentOn } catch {}
+                    }
+                    if (-not $d) {
+                        try { $d = $item.LastModificationTime } catch {}
+                    }
+                    if ($d) {
+                        $y = [int]$d.Year
+                        if ($yearCounts.ContainsKey($y)) {
+                            $yearCounts[$y]++
+                        } else {
+                            $yearCounts[$y] = 1
+                        }
+                    }
+                }
+            } catch {}
+        }
+
+        $yearBreakdown = @()
+        foreach ($y in ($yearCounts.Keys | Sort-Object -Descending)) {
+            $yearBreakdown += [pscustomobject]@{
+                year = [int]$y
+                count = [int]$yearCounts[$y]
+            }
+        }
+
+        $datedCount = 0
+        foreach ($k in $yearCounts.Keys) {
+            $datedCount += [int]$yearCounts[$k]
+        }
+        $undatedCount = [int]([Math]::Max(0, $count - $datedCount))
+
         $out.Value += [pscustomobject]@{
             type = "folder"
             path = $folderPath
             itemCount = $count
+            yearBreakdown = @($yearBreakdown)
+            undatedCount = $undatedCount
         }
         foreach ($sub in (Get-SubFolders-Safe -parentFolder $folder)) {
             Collect-PstFoldersRecursive -folder $sub -pathPrefix $folderPath -out $out

@@ -9,6 +9,7 @@ const import_progress = @import("import_progress.zig");
 const PstFolder = struct {
     path: []u8,
     item_count: usize,
+    year_summary: ?[]u8 = null,
 };
 
 /// Ejecuta el wizard de importacion de PST. Devuelve exit code del script
@@ -63,7 +64,10 @@ pub fn run(session: Session, allocator: std.mem.Allocator) !u8 {
 fn askPstFolders(allocator: std.mem.Allocator, pst_path: []const u8) ![][]u8 {
     const folders = try listPstFolders(allocator, pst_path);
     defer {
-        for (folders) |f| allocator.free(f.path);
+        for (folders) |f| {
+            allocator.free(f.path);
+            if (f.year_summary) |ys| allocator.free(ys);
+        }
         allocator.free(folders);
     }
 
@@ -84,7 +88,10 @@ fn askPstFolders(allocator: std.mem.Allocator, pst_path: []const u8) ![][]u8 {
     }
 
     for (folders, 0..) |f, i| {
-        const desc = try std.fmt.allocPrint(allocator, "{d} correo(s)", .{f.item_count});
+        const desc = if (f.year_summary) |ys|
+            try std.fmt.allocPrint(allocator, "{d} correo(s) | {s}", .{ f.item_count, ys })
+        else
+            try std.fmt.allocPrint(allocator, "{d} correo(s)", .{f.item_count});
         descriptions[i] = desc;
         items[i] = .{ .label = f.path, .description = desc };
     }
@@ -163,13 +170,87 @@ fn listPstFolders(allocator: std.mem.Allocator, pst_path: []const u8) ![]PstFold
             else => 0,
         } else 0;
 
+        const undated_count = parseUndatedCount(obj.get("undatedCount"));
+        const year_summary = blk: {
+            const base = try parseYearSummary(allocator, obj.get("yearBreakdown"));
+            if (undated_count == 0) break :blk base;
+
+            if (base) |b| {
+                const with_undated = try std.fmt.allocPrint(allocator, "{s} · sin_fecha({d})", .{ b, undated_count });
+                allocator.free(b);
+                break :blk with_undated;
+            }
+
+            break :blk try std.fmt.allocPrint(allocator, "Años: sin_fecha({d})", .{undated_count});
+        };
+
         try list.append(allocator, .{
             .path = try allocator.dupe(u8, path_val.string),
             .item_count = count,
+            .year_summary = year_summary,
         });
     }
 
     return try list.toOwnedSlice(allocator);
+}
+
+fn parseYearSummary(allocator: std.mem.Allocator, year_breakdown_val: ?std.json.Value) !?[]u8 {
+    const yb = year_breakdown_val orelse return null;
+    if (yb != .array) return null;
+    if (yb.array.items.len == 0) return null;
+
+    var parts = std.ArrayList([]const u8){};
+    defer {
+        for (parts.items) |p| allocator.free(p);
+        parts.deinit(allocator);
+    }
+
+    for (yb.array.items) |entry| {
+        if (entry != .object) continue;
+        const eobj = entry.object;
+        const yv = eobj.get("year") orelse continue;
+        const cv = eobj.get("count") orelse continue;
+
+        const year: i64 = switch (yv) {
+            .integer => |v| v,
+            .float => |v| @intFromFloat(v),
+            else => continue,
+        };
+
+        const cnt_raw: i64 = switch (cv) {
+            .integer => |v| v,
+            .float => |v| @intFromFloat(v),
+            else => continue,
+        };
+
+        const cnt: usize = if (cnt_raw > 0) @intCast(cnt_raw) else 0;
+
+        const part = try std.fmt.allocPrint(allocator, "{d}({d})", .{ year, cnt });
+        try parts.append(allocator, part);
+    }
+
+    if (parts.items.len == 0) return null;
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "Años: ");
+
+    for (parts.items, 0..) |part, i| {
+        if (i > 0) try buf.appendSlice(allocator, " · ");
+        try buf.appendSlice(allocator, part);
+    }
+
+    return try buf.toOwnedSlice(allocator);
+}
+
+fn parseUndatedCount(undated_count_val: ?std.json.Value) usize {
+    const uv = undated_count_val orelse return 0;
+    return switch (uv) {
+        .integer => |v| if (v > 0) @intCast(v) else 0,
+        .float => |v| if (v > 0) @intFromFloat(v) else 0,
+        else => 0,
+    };
 }
 
 fn askPstPath(allocator: std.mem.Allocator) ![]u8 {
