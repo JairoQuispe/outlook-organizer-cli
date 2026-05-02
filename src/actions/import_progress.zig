@@ -318,7 +318,16 @@ fn renderState(state: *State, buf: *tui.Buffer) anyerror!void {
     defer state.mutex.unlock();
 
     const area = buf.getArea();
-    if (area.width < 30 or area.height < 10) return;
+    clearRect(buf, area);
+
+    if (area.width < 30 or area.height < 10) {
+        if (area.width > 0 and area.height > 0) {
+            const message = "Ventana muy pequena: amplia la terminal para ver el progreso.";
+            const y = area.y + area.height / 2;
+            buf.setStringTruncated(area.x, y, message, area.width, .{ .fg = .yellow, .modifier = .{ .bold = true } });
+        }
+        return;
+    }
 
     const root_block = tui.Block{
         .title = " Importar correos desde PST ",
@@ -488,4 +497,26 @@ fn formatFilters(buf: []u8, year: ?[]const u8, months: ?[]const u8) []const u8 {
         return std.fmt.bufPrint(buf, "meses={s}", .{m}) catch "(filtro meses)";
     }
     return "(sin filtros)";
+}
+
+fn clearRect(buf: *tui.Buffer, rect: tui.Rect) void {
+    if (rect.width == 0 or rect.height == 0) return;
+
+    var row: u16 = 0;
+    while (row < rect.height) : (row += 1) {
+        clearLine(buf, rect.x, rect.y + row, rect.width);
+    }
+}
+
+fn clearLine(buf: *tui.Buffer, x: u16, y: u16, width: u16) void {
+    if (width == 0) return;
+
+    const spaces = "                                                                ";
+    var written: u16 = 0;
+    while (written < width) {
+        const remaining: u16 = width - written;
+        const chunk_len: usize = @min(@as(usize, remaining), spaces.len);
+        buf.setString(x + written, y, spaces[0..chunk_len], .{});
+        written += @as(u16, @intCast(chunk_len));
+    }
 }

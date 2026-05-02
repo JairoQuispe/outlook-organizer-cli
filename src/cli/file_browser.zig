@@ -11,7 +11,7 @@ const Entry = struct {
     size: u64,
 };
 
-const VIEWPORT: usize = 15;
+const VIEWPORT_MAX: usize = 64;
 const NAME_CELL_MAX: usize = 512;
 const LINE_CELL_MAX: usize = 640;
 
@@ -134,7 +134,7 @@ pub fn browseForFile(
         }
         // ajustar scroll
         if (cursor < scroll_top) scroll_top = cursor;
-        if (cursor >= scroll_top + VIEWPORT) scroll_top = cursor - VIEWPORT + 1;
+        if (cursor >= scroll_top + VIEWPORT_MAX) scroll_top = cursor - VIEWPORT_MAX + 1;
 
         const render_state = RenderState{
             .current_dir = current_dir,
@@ -330,7 +330,15 @@ const RenderState = struct {
 
 fn render(state: RenderState, buf: *tui.Buffer) anyerror!void {
     const area = buf.getArea();
-    if (area.width < 52 or area.height < 12) return;
+    clearRect(buf, area);
+    if (area.width < 52 or area.height < 12) {
+        if (area.width > 0 and area.height > 0) {
+            const message = "Ventana muy pequena: amplia la terminal para usar el explorador.";
+            const y = area.y + area.height / 2;
+            buf.setStringTruncated(area.x, y, message, area.width, .{ .fg = .yellow, .modifier = .{ .bold = true } });
+        }
+        return;
+    }
 
     const root = tui.Block{
         .title = " Explorador de archivos ",
@@ -370,19 +378,31 @@ fn render(state: RenderState, buf: *tui.Buffer) anyerror!void {
     const footer_h: u16 = 2;
     if (inner.y + inner.height <= table_y + footer_h) return;
     const table_h = inner.y + inner.height - table_y - footer_h;
+    if (table_h <= 1) return;
+
+    const max_rows: usize = @max(1, @min(@as(usize, table_h - 1), VIEWPORT_MAX));
+    var render_scroll_top = state.scroll_top;
+    if (state.entries.len > 0) {
+        if (state.cursor < render_scroll_top) {
+            render_scroll_top = state.cursor;
+        }
+        if (state.cursor >= render_scroll_top + max_rows) {
+            render_scroll_top = state.cursor - max_rows + 1;
+        }
+    }
 
     buf.setStringTruncated(inner.x, table_y, "Tipo   Nombre                              Tamano", inner.width, .{ .fg = .light_cyan, .modifier = .{ .bold = true } });
 
-    var name_cells: [VIEWPORT][NAME_CELL_MAX]u8 = undefined;
-    var size_cells: [VIEWPORT][32]u8 = undefined;
-    var line_cells: [VIEWPORT][LINE_CELL_MAX]u8 = undefined;
-    var roots: [VIEWPORT]tui.widgets.TreeNode = undefined;
+    var name_cells: [VIEWPORT_MAX][NAME_CELL_MAX]u8 = undefined;
+    var size_cells: [VIEWPORT_MAX][32]u8 = undefined;
+    var line_cells: [VIEWPORT_MAX][LINE_CELL_MAX]u8 = undefined;
+    var roots: [VIEWPORT_MAX]tui.widgets.TreeNode = undefined;
     var row_count: usize = 0;
 
     if (state.entries.len > 0) {
-        const end = @min(state.scroll_top + VIEWPORT, state.entries.len);
-        var i: usize = state.scroll_top;
-        while (i < end and row_count < VIEWPORT) : (i += 1) {
+        const end = @min(render_scroll_top + max_rows, state.entries.len);
+        var i: usize = render_scroll_top;
+        while (i < end and row_count < max_rows) : (i += 1) {
             const e = state.entries[i];
             const tipo: []const u8 = if (e.is_drive)
                 "UND"
@@ -406,10 +426,10 @@ fn render(state: RenderState, buf: *tui.Buffer) anyerror!void {
         }
     }
 
-    const selected_in_view: ?usize = if (state.entries.len == 0 or state.cursor < state.scroll_top or state.cursor >= state.scroll_top + row_count)
+    const selected_in_view: ?usize = if (state.entries.len == 0 or state.cursor < render_scroll_top or state.cursor >= render_scroll_top + row_count)
         null
     else
-        state.cursor - state.scroll_top;
+        state.cursor - render_scroll_top;
 
     if (row_count > 0) {
         const selected_idx = selected_in_view orelse 0;
@@ -454,5 +474,27 @@ fn formatSize(bytes: u64, buf: []u8) []const u8 {
         return std.fmt.bufPrint(buf, "{d:.2} KB", .{@as(f64, @floatFromInt(bytes)) / @as(f64, KB)}) catch "";
     } else {
         return std.fmt.bufPrint(buf, "{d} B", .{bytes}) catch "";
+    }
+}
+
+fn clearRect(buf: *tui.Buffer, rect: tui.Rect) void {
+    if (rect.width == 0 or rect.height == 0) return;
+
+    var row: u16 = 0;
+    while (row < rect.height) : (row += 1) {
+        clearLine(buf, rect.x, rect.y + row, rect.width);
+    }
+}
+
+fn clearLine(buf: *tui.Buffer, x: u16, y: u16, width: u16) void {
+    if (width == 0) return;
+
+    const spaces = "                                                                ";
+    var written: u16 = 0;
+    while (written < width) {
+        const remaining: u16 = width - written;
+        const chunk_len: usize = @min(@as(usize, remaining), spaces.len);
+        buf.setString(x + written, y, spaces[0..chunk_len], .{});
+        written += @as(u16, @intCast(chunk_len));
     }
 }

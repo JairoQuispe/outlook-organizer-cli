@@ -109,9 +109,19 @@ fn confirmWithDialog(question: []const u8, default_yes: bool) ?bool {
 
 fn renderConfirmView(view: *ConfirmView, buf: *tui.Buffer) anyerror!void {
     const area = buf.getArea();
-    if (area.width < 40 or area.height < 12) return;
+    clearRect(buf, area);
+    if (area.width < 40 or area.height < 12) {
+        if (area.width > 0 and area.height > 0) {
+            const message = "Ventana muy pequena: amplia la terminal para confirmar.";
+            const y = area.y + area.height / 2;
+            buf.setStringTruncated(area.x, y, message, area.width, .{ .fg = .yellow, .modifier = .{ .bold = true } });
+        }
+        return;
+    }
 
-    const popup_area = tui.centeredRectPct(area, 84, 46);
+    const popup_w_pct: u8 = if (area.width >= 120) 84 else 92;
+    const popup_h_pct: u8 = if (area.height >= 32) 46 else 62;
+    const popup_area = tui.centeredRectPct(area, popup_w_pct, popup_h_pct);
     const popup = tui.widgets.Popup{
         .title = " Confirmacion de filtro ",
         .border_style = .{ .fg = .cyan },
@@ -143,4 +153,26 @@ fn renderConfirmView(view: *ConfirmView, buf: *tui.Buffer) anyerror!void {
         9,
     );
     dialog.render(dialog_area, buf);
+}
+
+fn clearRect(buf: *tui.Buffer, rect: tui.Rect) void {
+    if (rect.width == 0 or rect.height == 0) return;
+
+    var row: u16 = 0;
+    while (row < rect.height) : (row += 1) {
+        clearLine(buf, rect.x, rect.y + row, rect.width);
+    }
+}
+
+fn clearLine(buf: *tui.Buffer, x: u16, y: u16, width: u16) void {
+    if (width == 0) return;
+
+    const spaces = "                                                                ";
+    var written: u16 = 0;
+    while (written < width) {
+        const remaining: u16 = width - written;
+        const chunk_len: usize = @min(@as(usize, remaining), spaces.len);
+        buf.setString(x + written, y, spaces[0..chunk_len], .{});
+        written += @as(u16, @intCast(chunk_len));
+    }
 }
