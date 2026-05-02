@@ -72,7 +72,8 @@ pub fn fetchStores(parent_allocator: std.mem.Allocator, script_path: []const u8)
     var list = std.ArrayList(Store){};
     if (stores_value == .array) {
         for (stores_value.array.items) |item| {
-            try list.append(allocator, try parseStore(allocator, item));
+            const store = try parseStore(allocator, item);
+            try list.append(allocator, store);
         }
     } else if (stores_value == .object) {
         try list.append(allocator, try parseStore(allocator, stores_value));
@@ -102,7 +103,22 @@ fn parseStore(allocator: std.mem.Allocator, value: std.json.Value) !Store {
 fn dupString(allocator: std.mem.Allocator, maybe: ?std.json.Value) !?[]const u8 {
     const v = maybe orelse return null;
     return switch (v) {
-        .string => |s| try allocator.dupe(u8, s),
+        .string => |s| blk: {
+            const trimmed = std.mem.trim(u8, s, " \t\r\n");
+            if (trimmed.len == 0) break :blk null;
+
+            // Validate UTF-8 and sanitize if invalid
+            if (!std.unicode.utf8ValidateSlice(trimmed)) {
+                // Replace invalid bytes with '?'
+                var sanitized = try allocator.alloc(u8, trimmed.len);
+                for (trimmed, 0..) |byte, i| {
+                    sanitized[i] = if (byte < 128) byte else '?';
+                }
+                break :blk sanitized;
+            }
+
+            break :blk try allocator.dupe(u8, trimmed);
+        },
         .null => null,
         else => null,
     };
@@ -121,9 +137,11 @@ fn readInt(maybe: ?std.json.Value) ?i64 {
 pub fn describeExchangeType(t: ?i64) []const u8 {
     if (t == null) return "";
     return switch (t.?) {
+        0 => " [Exchange]",
         1 => " [Exchange Principal]",
         2 => " [Exchange Delegado]",
-        3 => " [Carpetas Publicas]",
+        3 => " [PST/Publicas]",
+        4 => " [OST Cache]",
         else => "",
     };
 }

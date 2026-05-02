@@ -49,34 +49,34 @@ fn runPreflightAndSelect(allocator: std.mem.Allocator, as_json: bool) preflight.
     };
     defer stores_result.deinit();
 
-    // Filtrar: solo buzones con StoreId valido (requerido por las acciones siguientes).
-    var filtered_buf = std.ArrayList(list_stores.Store){};
-    defer filtered_buf.deinit(allocator);
+    const all_stores = stores_result.stores;
+    var valid_buf = std.ArrayList(list_stores.Store){};
+    defer valid_buf.deinit(allocator);
     var skipped: usize = 0;
-    for (stores_result.stores) |s| {
+    for (all_stores) |s| {
         if (s.store_id) |id| {
             if (id.len > 0) {
-                filtered_buf.append(allocator, s) catch return .failure;
+                valid_buf.append(allocator, s) catch return .failure;
                 continue;
             }
         }
         skipped += 1;
     }
-    const filtered = filtered_buf.items;
+    const valid = valid_buf.items;
 
     if (skipped > 0 and !as_json) {
-        std.debug.print("\n\x1b[90m[i] Se omitieron {d} buzon(es) sin StoreId valido.\x1b[0m\n", .{skipped});
+        std.debug.print("\n\x1b[90m[i] Se detectaron {d} buzon(es) sin StoreId; se muestran pero no se pueden seleccionar.\x1b[0m\n", .{skipped});
     }
 
-    if (filtered.len == 0) {
+    if (valid.len == 0) {
         std.debug.print("\n\x1b[31m[X]\x1b[0m  No hay buzones con StoreId valido para continuar.\n", .{});
         return .failure;
     }
 
     if (as_json) {
         // En modo JSON solo emitimos los stores filtrados y salimos.
-        std.debug.print("{{\"type\":\"stores\",\"count\":{d},\"skipped\":{d}}}\n", .{ filtered.len, skipped });
-        for (filtered, 0..) |s, i| {
+        std.debug.print("{{\"type\":\"stores\",\"count\":{d},\"skipped\":{d}}}\n", .{ valid.len, skipped });
+        for (valid, 0..) |s, i| {
             std.debug.print(
                 "{{\"type\":\"store\",\"index\":{d},\"displayName\":\"{s}\",\"storeId\":\"{s}\",\"filePath\":\"{s}\"}}\n",
                 .{
@@ -90,12 +90,19 @@ fn runPreflightAndSelect(allocator: std.mem.Allocator, as_json: bool) preflight.
         return .success;
     }
 
-    const selected_idx = store_selector.selectStore(filtered) orelse {
-        std.debug.print("\n\x1b[33m[!] Seleccion cancelada por el usuario.\x1b[0m\n", .{});
-        return .failure;
-    };
+    var selected: list_stores.Store = undefined;
+    while (true) {
+        const selected_idx = store_selector.selectStore(allocator, all_stores) orelse {
+            std.debug.print("\n\x1b[33m[!] Seleccion cancelada por el usuario.\x1b[0m\n", .{});
+            return .failure;
+        };
 
-    const selected = filtered[selected_idx];
+        selected = all_stores[selected_idx];
+        if (selected.store_id) |id| {
+            if (id.len > 0) break;
+        }
+        std.debug.print("\n\x1b[31m[X]\x1b[0m  El buzon seleccionado no expone un StoreId. Selecciona otro.\n", .{});
+    }
     const session = Session{
         .store_id = selected.store_id orelse "",
         .email = selected.display_name,

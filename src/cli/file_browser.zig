@@ -1,5 +1,5 @@
 const std = @import("std");
-const keyinput = @import("../windows/keyinput.zig");
+const tui = @import("zigtui");
 
 extern "kernel32" fn GetLogicalDrives() callconv(.winapi) u32;
 
@@ -12,6 +12,49 @@ const Entry = struct {
 };
 
 const VIEWPORT: usize = 15;
+const NAME_CELL_MAX: usize = 512;
+const LINE_CELL_MAX: usize = 640;
+
+fn sanitizeUtf8ForDisplay(input: []const u8, out: []u8) []const u8 {
+    if (out.len == 0) return "";
+
+    var in_i: usize = 0;
+    var out_i: usize = 0;
+
+    while (in_i < input.len and out_i < out.len) {
+        const first = input[in_i];
+        const seq_len = std.unicode.utf8ByteSequenceLength(first) catch {
+            out[out_i] = '?';
+            out_i += 1;
+            in_i += 1;
+            continue;
+        };
+
+        if (seq_len == 1) {
+            out[out_i] = first;
+            out_i += 1;
+            in_i += 1;
+            continue;
+        }
+
+        if (in_i + seq_len > input.len or out_i + seq_len > out.len) {
+            break;
+        }
+
+        _ = std.unicode.utf8Decode(input[in_i .. in_i + seq_len]) catch {
+            out[out_i] = '?';
+            out_i += 1;
+            in_i += 1;
+            continue;
+        };
+
+        @memcpy(out[out_i .. out_i + seq_len], input[in_i .. in_i + seq_len]);
+        out_i += seq_len;
+        in_i += seq_len;
+    }
+
+    return out[0..out_i];
+}
 
 /// Navegador de archivos interactivo. Devuelve la ruta absoluta del archivo
 /// seleccionado, o null si el usuario cancela con ESC.
@@ -33,15 +76,18 @@ pub fn browseForFile(
     }
     defer allocator.free(current_dir);
 
-    var raw = keyinput.RawMode.enter();
-    defer raw.leave();
+    var backend = try tui.init(allocator);
+    defer backend.deinit();
 
-    std.debug.print("\x1b[?25l", .{}); // ocultar cursor
-    defer std.debug.print("\x1b[?25h", .{});
+    var terminal = try tui.Terminal.init(allocator, backend.interface());
+    defer terminal.deinit();
+
+    try terminal.hideCursor();
+    defer terminal.showCursor() catch {};
 
     var cursor: usize = 0;
     var scroll_top: usize = 0;
-    var in_drives_view: bool = false;
+    var in_drives_view: bool = !std.unicode.utf8ValidateSlice(current_dir);
 
     while (true) {
         var entries = std.ArrayList(Entry){};
@@ -54,27 +100,31 @@ pub fn browseForFile(
             try loadDrives(allocator, &entries);
         } else {
             loadDirectory(allocator, current_dir, extension_filter, &entries) catch |err| {
-                // Mostrar error de forma persistente sin parpadeo
-                std.debug.print("\x1b[2J\x1b[H", .{});
-                std.debug.print("\x1b[1;36m== Explorador de archivos ==\x1b[0m\n\n", .{});
-                std.debug.print("\x1b[31m[X] Error al leer el directorio:\x1b[0m\n", .{});
-                std.debug.print("    {s}\n", .{@errorName(err)});
-                std.debug.print("    \x1b[90mRuta: {s}\x1b[0m\n\n", .{current_dir});
-                std.debug.print("\x1b[33mOpciones:\x1b[0m\n", .{});
-                std.debug.print("  - Presiona \x1b[1mESC\x1b[0m para cancelar\n", .{});
-                std.debug.print("  - Presiona \x1b[1mcualquier otra tecla\x1b[0m para ir a la vista de unidades\n", .{});
+                const msg = @errorName(err);
+                const error_state = RenderState{
+                    .current_dir = current_dir,
+                    .in_drives_view = in_drives_view,
+                    .entries = entries.items,
+                    .cursor = cursor,
+                    .scroll_top = scroll_top,
+                    .extension_filter = extension_filter,
+                    .error_message = msg,
+                };
+                try terminal.draw(
+                    error_state,
+                    render,
+                );
 
-                // Esperar input del usuario sin loop
-                const k = keyinput.readKey();
-                if (k == .escape) {
-                    std.debug.print("\x1b[2J\x1b[H", .{});
-                    return null;
+                while (true) {
+                    const ev = backend.interface().pollEvent(100) catch tui.Event.none;
+                    if (ev != .key) continue;
+                    if (ev.key.code == .esc) return null;
+
+                    in_drives_view = true;
+                    cursor = 0;
+                    scroll_top = 0;
+                    break;
                 }
-
-                // Ir a drives
-                in_drives_view = true;
-                cursor = 0;
-                scroll_top = 0;
                 continue;
             };
         }
@@ -86,19 +136,30 @@ pub fn browseForFile(
         if (cursor < scroll_top) scroll_top = cursor;
         if (cursor >= scroll_top + VIEWPORT) scroll_top = cursor - VIEWPORT + 1;
 
-        render(current_dir, in_drives_view, entries.items, cursor, scroll_top, extension_filter);
+        const render_state = RenderState{
+            .current_dir = current_dir,
+            .in_drives_view = in_drives_view,
+            .entries = entries.items,
+            .cursor = cursor,
+            .scroll_top = scroll_top,
+            .extension_filter = extension_filter,
+            .error_message = null,
+        };
+        try terminal.draw(render_state, render);
 
-        const key = keyinput.readKey();
-        switch (key) {
-            .arrow_up => {
+        const ev = backend.interface().pollEvent(100) catch tui.Event.none;
+        if (ev != .key) continue;
+
+        switch (ev.key.code) {
+            .up => {
                 if (entries.items.len == 0) continue;
                 cursor = if (cursor == 0) entries.items.len - 1 else cursor - 1;
             },
-            .arrow_down => {
+            .down => {
                 if (entries.items.len == 0) continue;
                 cursor = (cursor + 1) % entries.items.len;
             },
-            .arrow_left => {
+            .left => {
                 if (!in_drives_view) {
                     const res = try goUp(allocator, current_dir);
                     if (res) |new_path| {
@@ -150,13 +211,9 @@ pub fn browseForFile(
 
                 // Archivo: devolver path absoluto
                 const result = try std.fs.path.join(allocator, &.{ current_dir, selected.name });
-                std.debug.print("\x1b[2J\x1b[H", .{}); // limpia pantalla antes de volver
                 return result;
             },
-            .escape => {
-                std.debug.print("\x1b[2J\x1b[H", .{});
-                return null;
-            },
+            .esc => return null,
             else => {},
         }
     }
@@ -205,6 +262,8 @@ fn loadDirectory(
     extension_filter: ?[]const u8,
     entries: *std.ArrayList(Entry),
 ) !void {
+    if (!std.unicode.utf8ValidateSlice(path)) return error.InvalidUtf8Path;
+
     var dir = try std.fs.openDirAbsolute(path, .{ .iterate = true });
     defer dir.close();
 
@@ -220,6 +279,8 @@ fn loadDirectory(
 
     var it = dir.iterate();
     while (try it.next()) |entry| {
+        if (!std.unicode.utf8ValidateSlice(entry.name)) continue;
+
         const is_dir = entry.kind == .directory;
 
         if (!is_dir) {
@@ -257,79 +318,128 @@ fn entryLessThan(_: void, a: Entry, b: Entry) bool {
     return std.ascii.lessThanIgnoreCase(a.name, b.name);
 }
 
-fn render(
+const RenderState = struct {
     current_dir: []const u8,
     in_drives_view: bool,
     entries: []const Entry,
     cursor: usize,
     scroll_top: usize,
     extension_filter: ?[]const u8,
-) void {
-    std.debug.print("\x1b[2J\x1b[H", .{}); // limpia pantalla + home
-    std.debug.print("\x1b[1;36m== Explorador de archivos ==\x1b[0m\n", .{});
-    std.debug.print("\x1b[90m(Flechas Arriba/Abajo: navegar | Enter: abrir/seleccionar | Flecha Izquierda: subir | ESC: cancelar)\x1b[0m\n", .{});
+    error_message: ?[]const u8,
+};
 
-    if (extension_filter) |ext| {
-        std.debug.print("\x1b[90mFiltro: mostrando solo archivos {s}\x1b[0m\n", .{ext});
-    }
+fn render(state: RenderState, buf: *tui.Buffer) anyerror!void {
+    const area = buf.getArea();
+    if (area.width < 52 or area.height < 12) return;
 
-    std.debug.print("\n\x1b[1mUbicacion:\x1b[0m ", .{});
-    if (in_drives_view) {
-        std.debug.print("\x1b[33m[Unidades del sistema]\x1b[0m\n", .{});
-    } else {
-        std.debug.print("{s}\n", .{current_dir});
-    }
-    std.debug.print("\n", .{});
+    const root = tui.Block{
+        .title = " Explorador de archivos ",
+        .borders = tui.Borders.ALL,
+        .border_style = .{ .fg = .cyan },
+        .title_style = .{ .modifier = .{ .bold = true } },
+        .border_symbols = tui.BorderSymbols.rounded(),
+    };
+    root.render(area, buf);
+    const inner = root.inner(area);
+    if (inner.height < 7 or inner.width < 20) return;
 
-    if (entries.len == 0) {
-        std.debug.print("\x1b[90m   (directorio vacio o sin archivos que coincidan con el filtro)\x1b[0m\n", .{});
-        return;
-    }
+    buf.setStringTruncated(
+        inner.x,
+        inner.y,
+        "Arriba/Abajo: navegar | Enter: abrir/seleccionar | Izquierda: subir | ESC: cancelar",
+        inner.width,
+        .{ .fg = .gray },
+    );
 
-    const end = @min(scroll_top + VIEWPORT, entries.len);
-    if (scroll_top > 0) {
-        std.debug.print("\x1b[90m   ...\x1b[0m\n", .{});
-    }
-
-    var i: usize = scroll_top;
-    while (i < end) : (i += 1) {
-        renderRow(entries[i], i == cursor);
-    }
-
-    if (end < entries.len) {
-        std.debug.print("\x1b[90m   ... ({d} mas)\x1b[0m\n", .{entries.len - end});
-    }
-
-    std.debug.print("\n\x1b[90m   {d}/{d}\x1b[0m\n", .{ cursor + 1, entries.len });
-}
-
-fn renderRow(e: Entry, selected: bool) void {
-    const prefix: []const u8 = if (e.is_drive)
-        "[UND]"
-    else if (e.is_parent)
-        " .. "
-    else if (e.is_dir)
-        "[DIR]"
+    var location_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    var dir_display_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_display = sanitizeUtf8ForDisplay(state.current_dir, dir_display_buf[0..]);
+    const location = if (state.in_drives_view)
+        "Ubicacion: [Unidades del sistema]"
     else
-        "     ";
+        std.fmt.bufPrint(&location_buf, "Ubicacion: {s}", .{dir_display}) catch "Ubicacion";
+    buf.setStringTruncated(inner.x, inner.y + 1, location, inner.width, .{ .fg = .white });
 
-    if (selected) {
-        if (e.is_dir) {
-            std.debug.print("\x1b[1;42;30m > {s} {s}\\\x1b[0m\n", .{ prefix, e.name });
-        } else {
-            var size_buf: [32]u8 = undefined;
-            const size_str = formatSize(e.size, &size_buf);
-            std.debug.print("\x1b[1;42;30m > {s} {s}  {s}\x1b[0m\n", .{ prefix, e.name, size_str });
-        }
-    } else {
-        if (e.is_dir) {
-            std.debug.print("   \x1b[1;34m{s}\x1b[0m \x1b[34m{s}\\\x1b[0m\n", .{ prefix, e.name });
-        } else {
-            var size_buf: [32]u8 = undefined;
-            const size_str = formatSize(e.size, &size_buf);
-            std.debug.print("   \x1b[90m{s}\x1b[0m {s}  \x1b[90m{s}\x1b[0m\n", .{ prefix, e.name, size_str });
+    if (state.extension_filter) |ext| {
+        var filter_buf: [64]u8 = undefined;
+        const filter = std.fmt.bufPrint(&filter_buf, "Filtro activo: {s}", .{ext}) catch "";
+        buf.setStringTruncated(inner.x, inner.y + 2, filter, inner.width, .{ .fg = .gray });
+    }
+
+    const table_y = inner.y + 3;
+    const footer_h: u16 = 2;
+    if (inner.y + inner.height <= table_y + footer_h) return;
+    const table_h = inner.y + inner.height - table_y - footer_h;
+
+    buf.setStringTruncated(inner.x, table_y, "Tipo   Nombre                              Tamano", inner.width, .{ .fg = .light_cyan, .modifier = .{ .bold = true } });
+
+    var name_cells: [VIEWPORT][NAME_CELL_MAX]u8 = undefined;
+    var size_cells: [VIEWPORT][32]u8 = undefined;
+    var line_cells: [VIEWPORT][LINE_CELL_MAX]u8 = undefined;
+    var roots: [VIEWPORT]tui.widgets.TreeNode = undefined;
+    var row_count: usize = 0;
+
+    if (state.entries.len > 0) {
+        const end = @min(state.scroll_top + VIEWPORT, state.entries.len);
+        var i: usize = state.scroll_top;
+        while (i < end and row_count < VIEWPORT) : (i += 1) {
+            const e = state.entries[i];
+            const tipo: []const u8 = if (e.is_drive)
+                "UND"
+            else if (e.is_parent)
+                ".."
+            else if (e.is_dir)
+                "DIR"
+            else
+                "FILE";
+
+            const size_txt: []const u8 = if (e.is_dir) "-" else formatSize(e.size, size_cells[row_count][0..]);
+            const display_name = sanitizeUtf8ForDisplay(e.name, name_cells[row_count][0..]);
+            const line = std.fmt.bufPrint(
+                line_cells[row_count][0..],
+                "{s:<5} {s}  {s}",
+                .{ tipo, display_name, size_txt },
+            ) catch display_name;
+
+            roots[row_count] = .{ .label = line };
+            row_count += 1;
         }
     }
+
+    const selected_in_view: ?usize = if (state.entries.len == 0 or state.cursor < state.scroll_top or state.cursor >= state.scroll_top + row_count)
+        null
+    else
+        state.cursor - state.scroll_top;
+
+    if (row_count > 0) {
+        const selected_idx = selected_in_view orelse 0;
+        const tree = tui.widgets.Tree{
+            .roots = roots[0..row_count],
+            .selected = selected_idx,
+            .highlight_style = .{ .fg = .black, .bg = .cyan, .modifier = .{ .bold = true } },
+            .indent = 0,
+            .expanded_symbol = "",
+            .collapsed_symbol = "",
+            .leaf_symbol = "",
+        };
+        tree.render(.{ .x = inner.x, .y = table_y + 1, .width = inner.width, .height = table_h - 1 }, buf);
+    }
+
+    const footer_y = inner.y + inner.height - 2;
+    if (state.error_message) |err| {
+        var err_buf: [128]u8 = undefined;
+        const err_line = std.fmt.bufPrint(&err_buf, "Error leyendo directorio: {s}. ESC cancela; otra tecla va a unidades.", .{err}) catch "Error";
+        buf.setStringTruncated(inner.x, footer_y, err_line, inner.width, .{ .fg = .light_red, .modifier = .{ .bold = true } });
+    } else if (state.entries.len == 0) {
+        buf.setStringTruncated(inner.x, footer_y, "Directorio vacio o sin archivos que coincidan con el filtro.", inner.width, .{ .fg = .gray });
+    }
+
+    var pos_buf: [64]u8 = undefined;
+    const pos = if (state.entries.len == 0)
+        "0/0"
+    else
+        std.fmt.bufPrint(&pos_buf, "{d}/{d}", .{ state.cursor + 1, state.entries.len }) catch "";
+    buf.setStringTruncated(inner.x, inner.y + inner.height - 1, pos, inner.width, .{ .fg = .yellow });
 }
 
 fn formatSize(bytes: u64, buf: []u8) []const u8 {

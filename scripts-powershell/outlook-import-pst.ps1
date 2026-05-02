@@ -38,6 +38,9 @@ param (
     [switch]$AdaptiveThrottling,
 
     [Parameter(Mandatory=$false)]
+    [string]$IncludeFoldersJson,
+
+    [Parameter(Mandatory=$false)]
     [string[]]$IncludeFolders,
 
     [Parameter(Mandatory=$false)]
@@ -54,6 +57,10 @@ $ErrorActionPreference = "SilentlyContinue"
 
 if ($Json -or $Headless) {
     try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+
+    function Get-LogTimestamp {
+        return (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    }
 
     function Write-Host {
         param(
@@ -102,13 +109,18 @@ if ($Json -or $Headless) {
     }
 }
 
+function Get-LogTimestamp {
+    return (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+}
+
 function Emit-Log {
     param([string]$Level, [string]$Message)
-    $payload = @{ type = "log"; level = $Level; message = $Message }
+    $timestamp = Get-LogTimestamp
+    $payload = @{ type = "log"; level = $Level; message = $Message; timestamp = $timestamp }
     if ($Json) {
         Write-Output ($payload | ConvertTo-Json -Compress -Depth 6)
     } else {
-        Write-Host "[$Level] $Message"
+        Write-Host "[$timestamp] [$Level] $Message"
     }
 }
 
@@ -119,6 +131,46 @@ function Emit-ErrorPayload {
         Write-Output ($payload | ConvertTo-Json -Compress -Depth 6)
     } else {
         Write-Error $Message
+    }
+}
+
+function Emit-ScanProgress {
+    param(
+        [string]$Phase,
+        [string]$FolderPath,
+        [int]$CurrentItemCount,
+        [switch]$FolderCompleted
+    )
+
+    if (-not $script:ScanState) { return }
+
+    $elapsedMs = [long](([DateTime]::UtcNow - $script:ScanState.startedAt).TotalMilliseconds)
+    $totalFolders = [int]$script:ScanState.totalFolders
+    $scannedFolders = [int]$script:ScanState.scannedFolders
+    $percent = 0
+    if ($totalFolders -gt 0) {
+        $percent = [int][Math]::Floor(($scannedFolders * 100.0) / $totalFolders)
+        if ($percent -gt 100) { $percent = 100 }
+    }
+
+    $payload = @{
+        type = "scanProgress"
+        phase = $Phase
+        folderPath = $FolderPath
+        currentItemCount = [int]$CurrentItemCount
+        folderCompleted = [bool]$FolderCompleted
+        scannedFolders = $scannedFolders
+        totalFolders = $totalFolders
+        accumulatedItems = [long]$script:ScanState.accumulatedItems
+        percent = $percent
+        elapsedMs = $elapsedMs
+        pstSizeBytes = [long]$script:ScanState.pstSizeBytes
+    }
+
+    if ($Json) {
+        Write-Output ($payload | ConvertTo-Json -Compress -Depth 6)
+    } else {
+        Write-Host ("[scan] {0}% {1}/{2} folder={3} items={4}" -f $percent, $scannedFolders, $totalFolders, $FolderPath, $CurrentItemCount)
     }
 }
 
@@ -180,6 +232,9 @@ function Collect-PstFoldersRecursive {
                 $rows = $table.GetNextRows(300)
                 foreach ($row in $rows) {
                     $count++
+                    if (($count % 2000) -eq 0) {
+                        Emit-ScanProgress -Phase "folder_scan" -FolderPath $folderPath -CurrentItemCount $count
+                    }
                     $d = $row["ReceivedTime"]
                     if (-not $d) { $d = $row["CreationTime"] }
                     if (-not $d) {
@@ -207,8 +262,13 @@ function Collect-PstFoldersRecursive {
 
         if (-not $usedTable) {
             try {
+                $scanCount = 0
                 foreach ($item in $folder.Items) {
                     $d = $null
+                    $scanCount++
+                    if (($scanCount % 2000) -eq 0) {
+                        Emit-ScanProgress -Phase "folder_scan" -FolderPath $folderPath -CurrentItemCount $scanCount
+                    }
                     try { $d = $item.ReceivedTime } catch {}
                     if (-not $d) {
                         try { $d = $item.CreationTime } catch {}
@@ -252,10 +312,26 @@ function Collect-PstFoldersRecursive {
             yearBreakdown = @($yearBreakdown)
             undatedCount = $undatedCount
         }
+
+        if ($script:ScanState) {
+            $script:ScanState.scannedFolders = [int]$script:ScanState.scannedFolders + 1
+            $script:ScanState.accumulatedItems = [long]$script:ScanState.accumulatedItems + [long]$count
+            Emit-ScanProgress -Phase "folder_done" -FolderPath $folderPath -CurrentItemCount $count -FolderCompleted
+        }
+
         foreach ($sub in (Get-SubFolders-Safe -parentFolder $folder)) {
             Collect-PstFoldersRecursive -folder $sub -pathPrefix $folderPath -out $out
         }
     } catch {}
+}
+
+function Count-PstFoldersRecursive {
+    param($folder)
+    $count = 1
+    foreach ($sub in (Get-SubFolders-Safe -parentFolder $folder)) {
+        $count += Count-PstFoldersRecursive -folder $sub
+    }
+    return [int]$count
 }
 
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force | Out-Null
@@ -360,6 +436,22 @@ if (-not [string]::IsNullOrWhiteSpace($FilterOnlyMonths)) {
 }
 
 $SelectedFolderFilters = @()
+if ($IncludeFoldersJson) {
+    try {
+        $decodedFolders = ConvertFrom-Json -InputObject $IncludeFoldersJson -ErrorAction Stop
+    } catch {
+        Emit-ErrorPayload "No se pudo interpretar -IncludeFoldersJson: $($_.Exception.Message)"
+        exit 1
+    }
+
+    foreach ($f in @($decodedFolders)) {
+        $nf = Normalize-FolderPath "$f"
+        if (-not [string]::IsNullOrWhiteSpace($nf)) {
+            $SelectedFolderFilters += $nf
+        }
+    }
+}
+
 if ($IncludeFolders -and @($IncludeFolders).Count -gt 0) {
     foreach ($f in $IncludeFolders) {
         $nf = Normalize-FolderPath $f
@@ -367,6 +459,9 @@ if ($IncludeFolders -and @($IncludeFolders).Count -gt 0) {
             $SelectedFolderFilters += $nf
         }
     }
+}
+
+if ($SelectedFolderFilters.Count -gt 0) {
     $SelectedFolderFilters = @($SelectedFolderFilters | Sort-Object -Unique)
 }
 
@@ -576,22 +671,122 @@ function Analyze-PstFolderRecursive {
     }
 }
 
+function Normalize-MessageId {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $v = $Value.Trim().ToLowerInvariant()
+    if ($v.StartsWith("<") -and $v.EndsWith(">") -and $v.Length -gt 2) {
+        $v = $v.Substring(1, $v.Length - 2)
+    }
+    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+    return $v
+}
+
+function Convert-BytesToHex {
+    param($Bytes)
+    if ($null -eq $Bytes) { return $null }
+
+    $normalized = $null
+    try {
+        if ($Bytes -is [byte[]]) {
+            $normalized = $Bytes
+        } elseif ($Bytes -is [System.Array]) {
+            $tmp = New-Object 'System.Collections.Generic.List[byte]'
+            foreach ($b in $Bytes) {
+                try { $tmp.Add([byte]$b) } catch {}
+            }
+            if ($tmp.Count -eq 0) { return $null }
+            $normalized = $tmp.ToArray()
+        } else {
+            try { $normalized = [byte[]]$Bytes } catch { return $null }
+        }
+    } catch {
+        return $null
+    }
+
+    if (-not $normalized -or $normalized.Length -eq 0) { return $null }
+    return ([System.BitConverter]::ToString($normalized)).Replace("-", "").ToLowerInvariant()
+}
+
+function Get-DuplicateKeyFromRow {
+    param($row)
+
+    $msgId = $null
+    try { $msgId = $row["http://schemas.microsoft.com/mapi/proptag/0x1035001F"] } catch {}
+    if (-not $msgId) {
+        try { $msgId = $row["urn:schemas:mailheader:message-id"] } catch {}
+    }
+    $normalizedMsgId = Normalize-MessageId $msgId
+    if ($normalizedMsgId) {
+        return "mid:$normalizedMsgId"
+    }
+
+    $searchKey = $null
+    try { $searchKey = $row["http://schemas.microsoft.com/mapi/proptag/0x300B0102"] } catch {}
+    if ($searchKey) {
+        $hex = Convert-BytesToHex -Bytes $searchKey
+        if ($hex) { return "sk:$hex" }
+    }
+
+    return $null
+}
+
+function Get-DuplicateKeyFromItem {
+    param($item)
+
+    $msgId = $null
+    try { $msgId = $item.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x1035001F") } catch {}
+    if (-not $msgId) {
+        try { $msgId = $item.PropertyAccessor.GetProperty("urn:schemas:mailheader:message-id") } catch {}
+    }
+    $normalizedMsgId = Normalize-MessageId $msgId
+    if ($normalizedMsgId) {
+        return "mid:$normalizedMsgId"
+    }
+
+    $searchKey = $null
+    try { $searchKey = $item.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x300B0102") } catch {}
+    if ($searchKey) {
+        $hex = Convert-BytesToHex -Bytes $searchKey
+        if ($hex) { return "sk:$hex" }
+    }
+
+    return $null
+}
+
 function Build-DuplicateIndex {
     param($targetFolder)
-    $set = New-Object 'System.Collections.Generic.HashSet[string]'
+    $list = New-Object 'System.Collections.Generic.List[string]'
     try {
         $table = $targetFolder.GetTable("")
         $table.Columns.RemoveAll()
+        try { $table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x1035001F") | Out-Null } catch {}
         try { $table.Columns.Add("urn:schemas:mailheader:message-id") | Out-Null } catch {}
+        try { $table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x300B0102") | Out-Null } catch {}
         while (-not $table.EndOfTable) {
             $row = $table.GetNextRow()
             try {
-                $v = $row["urn:schemas:mailheader:message-id"]
-                if ($v) { [void]$set.Add([string]$v) }
+                $k = Get-DuplicateKeyFromRow -row $row
+                if ($k) { $list.Add([string]$k) }
             } catch {}
         }
     } catch {}
-    return $set
+
+    if ($list.Count -eq 0) {
+        try {
+            foreach ($it in $targetFolder.Items) {
+                $k = $null
+                try { $k = Get-DuplicateKeyFromItem -item $it } catch {}
+                if ($k) { $list.Add([string]$k) }
+            }
+        } catch {}
+    }
+
+    $readOnlySet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($key in $list) {
+        [void]$readOnlySet.Add($key)
+    }
+    return $readOnlySet
 }
 
 function Restore-FolderRecursive {
@@ -610,10 +805,13 @@ function Restore-FolderRecursive {
         return
     }
 
-    $dupIndex = $null
+    $existingKeys = $null
+    $runtimeDupKeys = $null
     if ($SkipDuplicates) {
         Emit-Log "info" "Indexando duplicados en: $folderPath"
-        $dupIndex = Build-DuplicateIndex -targetFolder $destFolder
+        $existingKeys = Build-DuplicateIndex -targetFolder $destFolder
+        $runtimeDupKeys = New-Object 'System.Collections.Generic.HashSet[string]'
+        Emit-Log "info" "Indice inicial: $($existingKeys.Count) claves existentes"
     }
 
     $items = $sourceFolder.Items
@@ -653,12 +851,18 @@ function Restore-FolderRecursive {
                 }
             }
 
-            if ($dupIndex -and $dupIndex.Count -gt 0) {
-                $msgId = $null
-                try { $msgId = $item.PropertyAccessor.GetProperty("urn:schemas:mailheader:message-id") } catch {}
-                if ($msgId -and $dupIndex.Contains([string]$msgId)) {
-                    $stats.Value.skipped++
-                    continue
+            $dupKey = $null
+            if ($existingKeys -or $runtimeDupKeys) {
+                $dupKey = Get-DuplicateKeyFromItem -item $item
+                if ($dupKey) {
+                    if ($existingKeys -and $existingKeys.Contains([string]$dupKey)) {
+                        $stats.Value.skipped++
+                        continue
+                    }
+                    if ($runtimeDupKeys -and $runtimeDupKeys.Contains([string]$dupKey)) {
+                        $stats.Value.skipped++
+                        continue
+                    }
                 }
             }
 
@@ -692,6 +896,12 @@ function Restore-FolderRecursive {
                     }
                 }
                 if ($Action -ieq "Move") { $stats.Value.moved++ } else { $stats.Value.copied++ }
+                if ($runtimeDupKeys -and $dupKey) {
+                    try {
+                        [void]$runtimeDupKeys.Add([string]$dupKey)
+                    } catch {
+                    }
+                }
             } catch {
                 $stats.Value.failed++
                 $reason = if (Is-ThrottlingError $_) { "throttled_max_retries" } else { "error" }
@@ -749,10 +959,41 @@ if ($pstStore) {
 $pstRoot = $pstStore.GetRootFolder()
 
 if ($ListFolders) {
+    $pstSizeBytes = 0
+    try {
+        $pstSizeBytes = [long](Get-Item -LiteralPath $PstPath -ErrorAction Stop).Length
+    } catch {}
+
+    $totalFoldersToScan = 0
+    foreach ($tf in (Get-SubFolders-Safe -parentFolder $pstRoot)) {
+        $totalFoldersToScan += Count-PstFoldersRecursive -folder $tf
+    }
+
+    $script:ScanState = @{
+        totalFolders = [int]$totalFoldersToScan
+        scannedFolders = 0
+        accumulatedItems = [long]0
+        pstSizeBytes = [long]$pstSizeBytes
+        startedAt = [DateTime]::UtcNow
+    }
+
+    if ($Json) {
+        Write-Output (@{
+            type = "scanMeta"
+            pstPath = $PstPath
+            pstSizeBytes = [long]$pstSizeBytes
+            totalFolders = [int]$totalFoldersToScan
+        } | ConvertTo-Json -Compress -Depth 6)
+    } else {
+        Emit-Log "info" "Escaneando PST... Carpetas estimadas: $totalFoldersToScan"
+    }
+
     $flat = [ref]@()
     foreach ($tf in (Get-SubFolders-Safe -parentFolder $pstRoot)) {
         Collect-PstFoldersRecursive -folder $tf -pathPrefix "" -out $flat
     }
+
+    Emit-ScanProgress -Phase "completed" -FolderPath "" -CurrentItemCount 0 -FolderCompleted
 
     Write-Output (@{ type = "folders"; count = @($flat.Value).Count } | ConvertTo-Json -Compress -Depth 6)
     foreach ($f in $flat.Value) {

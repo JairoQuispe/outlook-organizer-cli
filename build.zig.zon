@@ -1,6 +1,6 @@
 .{
     .name = .outlook_organizer,
-    .version = "0.0.6",
+    .version = "0.0.7",
     .fingerprint = 0xc4cd0fd4f8e51111,
     .minimum_zig_version = "0.15.1",
     .dependencies = .{

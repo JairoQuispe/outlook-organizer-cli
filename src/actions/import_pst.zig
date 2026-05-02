@@ -1,10 +1,32 @@
 const std = @import("std");
+const tui = @import("zigtui");
 const Session = @import("../session.zig").Session;
 const input = @import("../cli/input.zig");
 const menu = @import("../cli/menu.zig");
 const file_browser = @import("../cli/file_browser.zig");
+const pst_tree_selector = @import("../cli/pst_tree_selector.zig");
 const scripts = @import("../scripts/scripts.zig");
 const import_progress = @import("import_progress.zig");
+
+const SCAN_TEXT_MAX: usize = 320;
+
+const ScanViewState = struct {
+    pst_path: []const u8,
+    phase: [SCAN_TEXT_MAX]u8 = undefined,
+    phase_len: usize = 0,
+    folder: [SCAN_TEXT_MAX]u8 = undefined,
+    folder_len: usize = 0,
+    log: [SCAN_TEXT_MAX]u8 = undefined,
+    log_len: usize = 0,
+    percent: u8 = 0,
+    total_folders: usize = 0,
+    scanned_folders: usize = 0,
+    current_item_count: usize = 0,
+    accumulated_items: usize = 0,
+    pst_size_bytes: u64 = 0,
+    elapsed_ms: u64 = 0,
+    spinner_idx: usize = 0,
+};
 
 const PstFolder = struct {
     path: []u8,
@@ -48,7 +70,7 @@ pub fn run(session: Session, allocator: std.mem.Allocator) !u8 {
     }
 
     // 6) Saltar duplicados
-    const skip_dupes = input.confirm("\xc2\xbfSaltar duplicados (por Message-Id)?", false);
+    const skip_dupes = input.confirm("\xc2\xbfSaltar duplicados (Message-Id/Search-Key)?", false);
 
     // 7) Resumen y confirmacion
     printSummary(session, pst_path, selected_folders, action, filter_year, filter_months, skip_dupes);
@@ -76,27 +98,18 @@ fn askPstFolders(allocator: std.mem.Allocator, pst_path: []const u8) ![][]u8 {
         return error.NoFoldersFound;
     }
 
-    var items = try allocator.alloc(menu.MenuItem, folders.len);
-    defer allocator.free(items);
-
-    var descriptions = try allocator.alloc(?[]u8, folders.len);
-    defer {
-        for (descriptions) |d_opt| {
-            if (d_opt) |d| allocator.free(d);
-        }
-        allocator.free(descriptions);
-    }
+    var entries = try allocator.alloc(pst_tree_selector.FolderEntry, folders.len);
+    defer allocator.free(entries);
 
     for (folders, 0..) |f, i| {
-        const desc = if (f.year_summary) |ys|
-            try std.fmt.allocPrint(allocator, "{d} correo(s) | {s}", .{ f.item_count, ys })
-        else
-            try std.fmt.allocPrint(allocator, "{d} correo(s)", .{f.item_count});
-        descriptions[i] = desc;
-        items[i] = .{ .label = f.path, .description = desc };
+        entries[i] = .{
+            .path = f.path,
+            .item_count = f.item_count,
+            .year_summary = f.year_summary,
+        };
     }
 
-    const idxs = try menu.selectMultiple(allocator, "Selecciona carpetas del PST a importar", items) orelse {
+    const idxs = try pst_tree_selector.select(allocator, entries) orelse {
         return error.UserCancelled;
     };
     defer allocator.free(idxs);
@@ -116,82 +129,365 @@ fn listPstFolders(allocator: std.mem.Allocator, pst_path: []const u8) ![]PstFold
     const script_path = try scripts.getScriptPath(allocator, .import_pst);
     defer allocator.free(script_path);
 
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{
-            "powershell",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            script_path,
-            "-PstPath",
-            pst_path,
-            "-ListFolders",
-            "-Json",
-        },
-        .max_output_bytes = 8 * 1024 * 1024,
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+    var list = std.ArrayList(PstFolder){};
+    defer list.deinit(allocator);
 
-    switch (result.term) {
-        .Exited => |code| if (code != 0) {
-            if (result.stderr.len > 0) {
-                std.debug.print("\n\x1b[31mError listando carpetas PST:\x1b[0m\n{s}\n", .{result.stderr});
+    var child = std.process.Child.init(&.{
+        "powershell",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        script_path,
+        "-PstPath",
+        pst_path,
+        "-ListFolders",
+        "-Json",
+    }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch return error.ListFoldersFailed;
+
+    var scan_state = ScanViewState{ .pst_path = pst_path };
+    scan_state.phase_len = copyText(&scan_state.phase, "Preparando escaneo...");
+    scan_state.log_len = copyText(&scan_state.log, "Leyendo estructura del PST");
+
+    var backend = try tui.init(allocator);
+    defer backend.deinit();
+
+    var terminal = try tui.Terminal.init(allocator, backend.interface());
+    defer terminal.deinit();
+
+    try terminal.hideCursor();
+    defer terminal.showCursor() catch {};
+
+    try terminal.draw(&scan_state, renderScanView);
+
+    const stdout_file = child.stdout orelse return error.ListFoldersFailed;
+    var pending_stdout = std.ArrayList(u8){};
+    defer pending_stdout.deinit(allocator);
+
+    var read_chunk: [4096]u8 = undefined;
+    var child_error_msg: ?[]u8 = null;
+    defer if (child_error_msg) |msg| allocator.free(msg);
+
+    while (true) {
+        const read_n = try stdout_file.read(&read_chunk);
+        if (read_n == 0) break;
+        try pending_stdout.appendSlice(allocator, read_chunk[0..read_n]);
+
+        while (std.mem.indexOfScalar(u8, pending_stdout.items, '\n')) |line_end| {
+            const line = pending_stdout.items[0..line_end];
+            const trimmed = std.mem.trim(u8, line, " \r\n\t");
+            if (trimmed.len > 0 and trimmed[0] == '{') {
+                var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch {
+                    const consumed = line_end + 1;
+                    const rem = pending_stdout.items[consumed..];
+                    std.mem.copyForwards(u8, pending_stdout.items[0..rem.len], rem);
+                    pending_stdout.items.len = rem.len;
+                    continue;
+                };
+                defer parsed.deinit();
+
+                if (parsed.value == .object) {
+                    const obj = parsed.value.object;
+                    const type_val = obj.get("type");
+                    if (type_val != null and type_val.? == .string) {
+                        if (std.mem.eql(u8, type_val.?.string, "scanMeta")) {
+                            scan_state.total_folders = parsePositiveUsize(obj.get("totalFolders"));
+                            scan_state.pst_size_bytes = parsePositiveU64(obj.get("pstSizeBytes"));
+                            scan_state.log_len = copyText(&scan_state.log, "Escaneando carpetas y conteos por anio...");
+                            scan_state.spinner_idx +%= 1;
+                            try terminal.draw(&scan_state, renderScanView);
+                        } else if (std.mem.eql(u8, type_val.?.string, "scanProgress")) {
+                            const phase_val = obj.get("phase");
+                            if (phase_val != null and phase_val.? == .string) {
+                                scan_state.phase_len = copyText(&scan_state.phase, phase_val.?.string);
+                            }
+                            const folder_val = obj.get("folderPath");
+                            if (folder_val != null and folder_val.? == .string and folder_val.?.string.len > 0) {
+                                scan_state.folder_len = copyText(&scan_state.folder, folder_val.?.string);
+                            }
+                            scan_state.percent = parsePercent(obj.get("percent"));
+                            scan_state.scanned_folders = parsePositiveUsize(obj.get("scannedFolders"));
+                            scan_state.total_folders = parsePositiveUsizeOr(scan_state.total_folders, obj.get("totalFolders"));
+                            scan_state.current_item_count = parsePositiveUsize(obj.get("currentItemCount"));
+                            scan_state.accumulated_items = parsePositiveUsize(obj.get("accumulatedItems"));
+                            scan_state.elapsed_ms = parsePositiveU64(obj.get("elapsedMs"));
+                            scan_state.pst_size_bytes = parsePositiveU64Or(scan_state.pst_size_bytes, obj.get("pstSizeBytes"));
+                            scan_state.spinner_idx +%= 1;
+                            try terminal.draw(&scan_state, renderScanView);
+                        } else if (std.mem.eql(u8, type_val.?.string, "log")) {
+                            const msg_val = obj.get("message");
+                            if (msg_val != null and msg_val.? == .string and msg_val.?.string.len > 0) {
+                                scan_state.log_len = copyText(&scan_state.log, msg_val.?.string);
+                                scan_state.spinner_idx +%= 1;
+                                try terminal.draw(&scan_state, renderScanView);
+                            }
+                        } else if (std.mem.eql(u8, type_val.?.string, "error")) {
+                            const msg_val = obj.get("message");
+                            if (msg_val != null and msg_val.? == .string and msg_val.?.string.len > 0) {
+                                if (child_error_msg) |old_msg| allocator.free(old_msg);
+                                child_error_msg = try allocator.dupe(u8, msg_val.?.string);
+                            }
+                        } else if (std.mem.eql(u8, type_val.?.string, "folder")) {
+                            const path_val = obj.get("path");
+                            if (path_val != null and path_val.? == .string) {
+                                const count: usize = parsePositiveUsize(obj.get("itemCount"));
+                                const undated_count = parseUndatedCount(obj.get("undatedCount"));
+                                const year_summary = blk: {
+                                    const base = try parseYearSummary(allocator, obj.get("yearBreakdown"));
+                                    if (undated_count == 0) break :blk base;
+                                    if (base) |b| {
+                                        const with_undated = try std.fmt.allocPrint(allocator, "{s} · sin_fecha({d})", .{ b, undated_count });
+                                        allocator.free(b);
+                                        break :blk with_undated;
+                                    }
+                                    break :blk try std.fmt.allocPrint(allocator, "Años: sin_fecha({d})", .{undated_count});
+                                };
+
+                                if (count == 0) {
+                                    if (year_summary) |ys| allocator.free(ys);
+                                } else {
+                                    try list.append(allocator, .{
+                                        .path = try allocator.dupe(u8, path_val.?.string),
+                                        .item_count = count,
+                                        .year_summary = year_summary,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            return error.ListFoldersFailed;
+
+            const consumed = line_end + 1;
+            const rem = pending_stdout.items[consumed..];
+            std.mem.copyForwards(u8, pending_stdout.items[0..rem.len], rem);
+            pending_stdout.items.len = rem.len;
+        }
+    }
+
+    if (pending_stdout.items.len > 0) {
+        const trimmed = std.mem.trim(u8, pending_stdout.items, " \r\n\t");
+        if (trimmed.len > 0 and trimmed[0] == '{') {
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch null;
+            if (parsed) |*p| {
+                defer p.deinit();
+                if (p.value == .object) {
+                    const obj = p.value.object;
+                    const type_val = obj.get("type");
+                    if (type_val != null and type_val.? == .string and std.mem.eql(u8, type_val.?.string, "folder")) {
+                        const path_val = obj.get("path");
+                        if (path_val != null and path_val.? == .string) {
+                            const count: usize = parsePositiveUsize(obj.get("itemCount"));
+                            const undated_count = parseUndatedCount(obj.get("undatedCount"));
+                            const year_summary = blk: {
+                                const base = try parseYearSummary(allocator, obj.get("yearBreakdown"));
+                                if (undated_count == 0) break :blk base;
+                                if (base) |b| {
+                                    const with_undated = try std.fmt.allocPrint(allocator, "{s} · sin_fecha({d})", .{ b, undated_count });
+                                    allocator.free(b);
+                                    break :blk with_undated;
+                                }
+                                break :blk try std.fmt.allocPrint(allocator, "Años: sin_fecha({d})", .{undated_count});
+                            };
+
+                            if (count == 0) {
+                                if (year_summary) |ys| allocator.free(ys);
+                            } else {
+                                try list.append(allocator, .{
+                                    .path = try allocator.dupe(u8, path_val.?.string),
+                                    .item_count = count,
+                                    .year_summary = year_summary,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    const stderr_text = blk: {
+        if (child.stderr) |stderr_file| {
+            break :blk try stderr_file.readToEndAlloc(allocator, 128 * 1024);
+        }
+        break :blk try allocator.dupe(u8, "");
+    };
+    defer allocator.free(stderr_text);
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| {
+            if (code != 0) {
+                std.debug.print("\x1b[2J\x1b[H", .{});
+                if (child_error_msg) |msg| {
+                    std.debug.print("\n\x1b[31mError listando carpetas PST:\x1b[0m\n{s}\n", .{msg});
+                } else if (stderr_text.len > 0) {
+                    std.debug.print("\n\x1b[31mError listando carpetas PST:\x1b[0m\n{s}\n", .{stderr_text});
+                }
+                return error.ListFoldersFailed;
+            }
         },
         else => return error.ListFoldersFailed,
     }
 
-    var list = std.ArrayList(PstFolder){};
-    defer list.deinit(allocator);
-
-    var it = std.mem.splitScalar(u8, result.stdout, '\n');
-    while (it.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \r\n\t");
-        if (trimmed.len == 0 or trimmed[0] != '{') continue;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch continue;
-        defer parsed.deinit();
-        if (parsed.value != .object) continue;
-        const obj = parsed.value.object;
-
-        const type_val = obj.get("type") orelse continue;
-        if (type_val != .string or !std.mem.eql(u8, type_val.string, "folder")) continue;
-
-        const path_val = obj.get("path") orelse continue;
-        if (path_val != .string) continue;
-        const count_val = obj.get("itemCount");
-        const count: usize = if (count_val) |v| switch (v) {
-            .integer => |i| if (i > 0) @intCast(i) else 0,
-            .float => |f| if (f > 0) @intFromFloat(f) else 0,
-            else => 0,
-        } else 0;
-
-        const undated_count = parseUndatedCount(obj.get("undatedCount"));
-        const year_summary = blk: {
-            const base = try parseYearSummary(allocator, obj.get("yearBreakdown"));
-            if (undated_count == 0) break :blk base;
-
-            if (base) |b| {
-                const with_undated = try std.fmt.allocPrint(allocator, "{s} · sin_fecha({d})", .{ b, undated_count });
-                allocator.free(b);
-                break :blk with_undated;
-            }
-
-            break :blk try std.fmt.allocPrint(allocator, "Años: sin_fecha({d})", .{undated_count});
-        };
-
-        try list.append(allocator, .{
-            .path = try allocator.dupe(u8, path_val.string),
-            .item_count = count,
-            .year_summary = year_summary,
-        });
-    }
+    std.debug.print("\x1b[2J\x1b[H", .{});
 
     return try list.toOwnedSlice(allocator);
+}
+
+fn renderScanView(state: *ScanViewState, buf: *tui.Buffer) anyerror!void {
+    const spinner = [_][]const u8{ "|", "/", "-", "\\" };
+    const spin = spinner[state.spinner_idx % spinner.len];
+
+    var size_buf: [32]u8 = undefined;
+    const size_txt = formatBytes(&size_buf, state.pst_size_bytes);
+
+    var elapsed_buf: [24]u8 = undefined;
+    const elapsed_txt = formatElapsed(&elapsed_buf, state.elapsed_ms);
+
+    const area = buf.getArea();
+    if (area.width < 48 or area.height < 14) return;
+
+    const popup_area = tui.centeredRectPct(area, 88, 72);
+    const popup = tui.widgets.Popup{
+        .title = " Escaneo de PST ",
+        .border_style = .{ .fg = .cyan },
+        .backdrop_style = .{ .fg = .dark_gray },
+        .show_backdrop = true,
+    };
+    popup.render(popup_area, buf);
+
+    const inner = tui.widgets.Popup.innerArea(popup_area);
+    if (inner.width < 32 or inner.height < 10) return;
+
+    var title_buf: [96]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buf, "Escaneando estructura y metricas {s}", .{spin}) catch "Escaneando";
+    buf.setStringTruncated(inner.x, inner.y, title, inner.width, .{ .fg = .light_cyan, .modifier = .{ .bold = true } });
+    buf.setStringTruncated(inner.x, inner.y + 1, state.pst_path, inner.width, .{ .fg = .gray });
+
+    var stats1_buf: [128]u8 = undefined;
+    const stats1 = std.fmt.bufPrint(&stats1_buf, "Tamano: {s} | Tiempo: {s}", .{ size_txt, elapsed_txt }) catch "";
+    buf.setStringTruncated(inner.x, inner.y + 2, stats1, inner.width, .{ .fg = .white });
+
+    var stats2_buf: [128]u8 = undefined;
+    const stats2 = std.fmt.bufPrint(
+        &stats2_buf,
+        "Carpetas: {d}/{d} | Item actual: {d} | Acumulados: {d}",
+        .{ state.scanned_folders, state.total_folders, state.current_item_count, state.accumulated_items },
+    ) catch "";
+    buf.setStringTruncated(inner.x, inner.y + 3, stats2, inner.width, .{ .fg = .white });
+
+    const graph_y = inner.y + 4;
+    const graph_h: u16 = if (inner.height > 9) 4 else 2;
+    const graph_w = inner.width;
+    if (graph_h >= 2 and graph_w >= 10) {
+        const graph_area = tui.Rect{ .x = inner.x, .y = graph_y, .width = graph_w, .height = graph_h };
+        var canvas = tui.widgets.Canvas.init(graph_area, buf, .{ .fg = .white });
+        canvas.drawBox(.{ .x = 0, .y = 0, .width = graph_w, .height = graph_h }, .{ .fg = .dark_gray });
+
+        const usable_w: u16 = graph_w -| 2;
+        const fill: u16 = @intCast((@as(usize, state.percent) * usable_w) / 100);
+        const bar_y: u16 = if (graph_h > 2) graph_h / 2 else 1;
+        if (fill > 0) {
+            canvas.drawHLine(1, fill, bar_y, '█', .{ .fg = .green });
+        }
+        if (fill < usable_w) {
+            canvas.drawHLine(1 + fill, usable_w - fill, bar_y, '░', .{ .fg = .dark_gray });
+        }
+
+        var pct_buf: [16]u8 = undefined;
+        const pct = std.fmt.bufPrint(&pct_buf, "{d}%", .{state.percent}) catch "";
+        const pct_x: u16 = if (graph_w > pct.len) (graph_w - @as(u16, @intCast(pct.len))) / 2 else 1;
+        canvas.drawText(pct_x, 0, pct, .{ .fg = .yellow, .modifier = .{ .bold = true } });
+    }
+
+    var line_y = graph_y + graph_h;
+    if (line_y < inner.y + inner.height) {
+        if (state.phase_len > 0) {
+            var phase_buf: [SCAN_TEXT_MAX + 16]u8 = undefined;
+            const phase = std.fmt.bufPrint(&phase_buf, "Fase: {s}", .{state.phase[0..state.phase_len]}) catch "";
+            buf.setStringTruncated(inner.x, line_y, phase, inner.width, .{ .fg = .light_white });
+            line_y += 1;
+        }
+    }
+    if (line_y < inner.y + inner.height) {
+        if (state.folder_len > 0) {
+            var folder_buf: [SCAN_TEXT_MAX + 24]u8 = undefined;
+            const folder = std.fmt.bufPrint(&folder_buf, "Carpeta: {s}", .{state.folder[0..state.folder_len]}) catch "";
+            buf.setStringTruncated(inner.x, line_y, folder, inner.width, .{ .fg = .gray });
+            line_y += 1;
+        }
+    }
+    if (line_y < inner.y + inner.height and state.log_len > 0) {
+        var log_buf: [SCAN_TEXT_MAX + 24]u8 = undefined;
+        const log_line = std.fmt.bufPrint(&log_buf, "Detalle: {s}", .{state.log[0..state.log_len]}) catch "";
+        buf.setStringTruncated(inner.x, line_y, log_line, inner.width, .{ .fg = .gray });
+    }
+}
+
+fn copyText(dest: *[SCAN_TEXT_MAX]u8, src: []const u8) usize {
+    const n = @min(dest.len, src.len);
+    @memcpy(dest[0..n], src[0..n]);
+    return n;
+}
+
+fn parsePositiveUsize(value: ?std.json.Value) usize {
+    const v = value orelse return 0;
+    return switch (v) {
+        .integer => |i| if (i > 0) @intCast(i) else 0,
+        .float => |f| if (f > 0) @intFromFloat(f) else 0,
+        else => 0,
+    };
+}
+
+fn parsePositiveUsizeOr(current: usize, value: ?std.json.Value) usize {
+    const parsed = parsePositiveUsize(value);
+    return if (parsed > 0) parsed else current;
+}
+
+fn parsePositiveU64(value: ?std.json.Value) u64 {
+    const v = value orelse return 0;
+    return switch (v) {
+        .integer => |i| if (i > 0) @intCast(i) else 0,
+        .float => |f| if (f > 0) @intFromFloat(f) else 0,
+        else => 0,
+    };
+}
+
+fn parsePositiveU64Or(current: u64, value: ?std.json.Value) u64 {
+    const parsed = parsePositiveU64(value);
+    return if (parsed > 0) parsed else current;
+}
+
+fn parsePercent(value: ?std.json.Value) u8 {
+    const p = parsePositiveUsize(value);
+    if (p >= 100) return 100;
+    return @intCast(p);
+}
+
+fn formatBytes(buf: []u8, bytes: u64) []const u8 {
+    if (bytes >= 1024 * 1024 * 1024) {
+        return std.fmt.bufPrint(buf, "{d:.2} GB", .{@as(f64, @floatFromInt(bytes)) / 1073741824.0}) catch "0 B";
+    }
+    if (bytes >= 1024 * 1024) {
+        return std.fmt.bufPrint(buf, "{d:.2} MB", .{@as(f64, @floatFromInt(bytes)) / 1048576.0}) catch "0 B";
+    }
+    if (bytes >= 1024) {
+        return std.fmt.bufPrint(buf, "{d:.2} KB", .{@as(f64, @floatFromInt(bytes)) / 1024.0}) catch "0 B";
+    }
+    return std.fmt.bufPrint(buf, "{d} B", .{bytes}) catch "0 B";
+}
+
+fn formatElapsed(buf: []u8, elapsed_ms: u64) []const u8 {
+    const total_seconds: u64 = elapsed_ms / 1000;
+    const minutes: u64 = total_seconds / 60;
+    const seconds: u64 = total_seconds % 60;
+    return std.fmt.bufPrint(buf, "{d}m {d}s", .{ minutes, seconds }) catch "0m 0s";
 }
 
 fn parseYearSummary(allocator: std.mem.Allocator, year_breakdown_val: ?std.json.Value) !?[]u8 {
@@ -402,6 +698,9 @@ fn executePowerShell(
     const script_path = try scripts.getScriptPath(allocator, .import_pst);
     defer allocator.free(script_path);
 
+    const selected_folders_json = try buildJsonArrayString(allocator, selected_folders);
+    defer allocator.free(selected_folders_json);
+
     var argv = std.ArrayList([]const u8){};
     defer argv.deinit(allocator);
 
@@ -421,10 +720,8 @@ fn executePowerShell(
     try argv.append(allocator, "-Action");
     try argv.append(allocator, action);
 
-    for (selected_folders) |folder_path| {
-        try argv.append(allocator, "-IncludeFolders");
-        try argv.append(allocator, folder_path);
-    }
+    try argv.append(allocator, "-IncludeFoldersJson");
+    try argv.append(allocator, selected_folders_json);
 
     if (filter_year) |fy| {
         try argv.append(allocator, "-FilterOnlyYear");
@@ -467,4 +764,33 @@ fn executePowerShell(
         std.debug.print("\x1b[1;31m[X]\x1b[0m Importacion finalizo con errores (exit code {d}).\n", .{code});
     }
     return code;
+}
+
+fn buildJsonArrayString(allocator: std.mem.Allocator, values: []const []const u8) ![]u8 {
+    var buf = std.ArrayList(u8){};
+    errdefer buf.deinit(allocator);
+
+    try buf.append(allocator, '[');
+    for (values, 0..) |value, i| {
+        if (i > 0) try buf.appendSlice(allocator, ",");
+        try appendJsonString(&buf, allocator, value);
+    }
+    try buf.append(allocator, ']');
+
+    return try buf.toOwnedSlice(allocator);
+}
+
+fn appendJsonString(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+    try buf.append(allocator, '"');
+    for (value) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            else => try buf.append(allocator, c),
+        }
+    }
+    try buf.append(allocator, '"');
 }
