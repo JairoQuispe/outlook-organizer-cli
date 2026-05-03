@@ -50,7 +50,10 @@ param (
     [switch]$Json,
 
     [Parameter(Mandatory=$false)]
-    [switch]$Headless
+    [switch]$Headless,
+
+    [Parameter(Mandatory=$false)]
+    [switch]$DeepDuplicateCheck
 )
 
 $ErrorActionPreference = "SilentlyContinue"
@@ -476,6 +479,8 @@ $script:TokenBucket = @{
     lastStatsEmit = [DateTime]::UtcNow
 }
 
+$script:DupIndexCache = New-Object 'System.Collections.Generic.Dictionary[string, System.Collections.Generic.HashSet[string]]'
+
 function Wait-ForToken {
     while ($true) {
         $now = [DateTime]::UtcNow
@@ -682,6 +687,17 @@ function Normalize-MessageId {
     return $v
 }
 
+function Normalize-Subject {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+
+    $v = $Value.Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+    $v = [regex]::Replace($v, "\s+", " ")
+    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+    return $v
+}
+
 function Convert-BytesToHex {
     param($Bytes)
     if ($null -eq $Bytes) { return $null }
@@ -717,15 +733,30 @@ function Get-DuplicateKeyFromRow {
         try { $msgId = $row["urn:schemas:mailheader:message-id"] } catch {}
     }
     $normalizedMsgId = Normalize-MessageId $msgId
-    if ($normalizedMsgId) {
-        return "mid:$normalizedMsgId"
-    }
+    if ($normalizedMsgId) { return "mid:$normalizedMsgId" }
 
     $searchKey = $null
     try { $searchKey = $row["http://schemas.microsoft.com/mapi/proptag/0x300B0102"] } catch {}
     if ($searchKey) {
         $hex = Convert-BytesToHex -Bytes $searchKey
         if ($hex) { return "sk:$hex" }
+    }
+
+    $subject = $null
+    try { $subject = $row["Subject"] } catch {}
+    $normalizedSubject = Normalize-Subject $subject
+    $dateStr = "nodate"
+    try { $d = $row["ReceivedTime"]; if ($d) { $dateStr = ([datetime]$d).ToString("yyyyMMddHHmmss") } } catch {}
+    if ($dateStr -eq "nodate") {
+        try { $d = $row["SentOn"]; if ($d) { $dateStr = ([datetime]$d).ToString("yyyyMMddHHmmss") } } catch {}
+    }
+    $sender = "nosender"
+    try { $s = $row["http://schemas.microsoft.com/mapi/proptag/0x0065001F"]; if ($s) { $sender = ([string]$s).ToLowerInvariant() } } catch {}
+    $sz = "nosz"
+    try { $v = $row["Size"]; if ($null -ne $v) { $sz = "$([long]$v)" } } catch {}
+
+    if ($normalizedSubject -and $dateStr -ne "nodate") {
+        return "comp:$normalizedSubject|$dateStr|$sender|$sz"
     }
 
     return $null
@@ -740,9 +771,7 @@ function Get-DuplicateKeyFromItem {
         try { $msgId = $item.PropertyAccessor.GetProperty("urn:schemas:mailheader:message-id") } catch {}
     }
     $normalizedMsgId = Normalize-MessageId $msgId
-    if ($normalizedMsgId) {
-        return "mid:$normalizedMsgId"
-    }
+    if ($normalizedMsgId) { return "mid:$normalizedMsgId" }
 
     $searchKey = $null
     try { $searchKey = $item.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x300B0102") } catch {}
@@ -751,15 +780,36 @@ function Get-DuplicateKeyFromItem {
         if ($hex) { return "sk:$hex" }
     }
 
+    $subject = $null
+    try { $subject = [string]$item.Subject } catch {}
+    $normalizedSubject = Normalize-Subject $subject
+    $dateStr = "nodate"
+    try { $d = $item.ReceivedTime; if ($d) { $dateStr = ([datetime]$d).ToString("yyyyMMddHHmmss") } } catch {}
+    if ($dateStr -eq "nodate") {
+        try { $d = $item.SentOn; if ($d) { $dateStr = ([datetime]$d).ToString("yyyyMMddHHmmss") } } catch {}
+    }
+    $sender = "nosender"
+    try { $s = $item.SenderEmailAddress; if ($s) { $sender = ([string]$s).ToLowerInvariant() } } catch {}
+    $sz = "nosz"
+    try { $v = [long]$item.Size; if ($v -ge 0) { $sz = "$v" } } catch {}
+
+    if ($normalizedSubject -and $dateStr -ne "nodate") {
+        return "comp:$normalizedSubject|$dateStr|$sender|$sz"
+    }
+
     return $null
 }
 
-function Build-DuplicateIndex {
-    param($targetFolder)
-    $list = New-Object 'System.Collections.Generic.List[string]'
+function Build-DuplicateIndexFromFolder {
+    param($folder, [System.Collections.Generic.List[string]]$list)
     try {
-        $table = $targetFolder.GetTable("")
+        $table = $folder.GetTable("")
         $table.Columns.RemoveAll()
+        try { $table.Columns.Add("Subject") | Out-Null } catch {}
+        try { $table.Columns.Add("Size") | Out-Null } catch {}
+        try { $table.Columns.Add("ReceivedTime") | Out-Null } catch {}
+        try { $table.Columns.Add("SentOn") | Out-Null } catch {}
+        try { $table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x0065001F") | Out-Null } catch {}
         try { $table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x1035001F") | Out-Null } catch {}
         try { $table.Columns.Add("urn:schemas:mailheader:message-id") | Out-Null } catch {}
         try { $table.Columns.Add("http://schemas.microsoft.com/mapi/proptag/0x300B0102") | Out-Null } catch {}
@@ -770,22 +820,51 @@ function Build-DuplicateIndex {
                 if ($k) { $list.Add([string]$k) }
             } catch {}
         }
+        return
     } catch {}
 
-    if ($list.Count -eq 0) {
-        try {
-            foreach ($it in $targetFolder.Items) {
-                $k = $null
-                try { $k = Get-DuplicateKeyFromItem -item $it } catch {}
-                if ($k) { $list.Add([string]$k) }
-            }
-        } catch {}
+    try {
+        foreach ($it in $folder.Items) {
+            $k = $null
+            try { $k = Get-DuplicateKeyFromItem -item $it } catch {}
+            if ($k) { $list.Add([string]$k) }
+        }
+    } catch {}
+}
+
+function Build-DuplicateIndexRecursive {
+    param($folder, [System.Collections.Generic.List[string]]$list)
+    foreach ($sub in (Get-SubFolders-Safe -parentFolder $folder)) {
+        Build-DuplicateIndexFromFolder -folder $sub -list $list
+        Build-DuplicateIndexRecursive -folder $sub -list $list
+    }
+}
+
+function Build-DuplicateIndex {
+    param($targetFolder, [switch]$Deep)
+
+    $folderId = $null
+    try { $folderId = $targetFolder.EntryID } catch {}
+    if ($folderId -and $script:DupIndexCache.ContainsKey($folderId)) {
+        return $script:DupIndexCache[$folderId]
+    }
+
+    $list = New-Object 'System.Collections.Generic.List[string]'
+    Build-DuplicateIndexFromFolder -folder $targetFolder -list $list
+
+    if ($Deep) {
+        Build-DuplicateIndexRecursive -folder $targetFolder -list $list
     }
 
     $readOnlySet = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($key in $list) {
         [void]$readOnlySet.Add($key)
     }
+
+    if ($folderId) {
+        $script:DupIndexCache[$folderId] = $readOnlySet
+    }
+
     return $readOnlySet
 }
 
@@ -809,9 +888,9 @@ function Restore-FolderRecursive {
     $runtimeDupKeys = $null
     if ($SkipDuplicates) {
         Emit-Log "info" "Indexando duplicados en: $folderPath"
-        $existingKeys = Build-DuplicateIndex -targetFolder $destFolder
+        $existingKeys = Build-DuplicateIndex -targetFolder $destFolder -Deep:$DeepDuplicateCheck
         $runtimeDupKeys = New-Object 'System.Collections.Generic.HashSet[string]'
-        Emit-Log "info" "Indice inicial: $($existingKeys.Count) claves existentes"
+        Emit-Log "info" "Indice inicial: $($existingKeys.Count) claves existentes$(if ($DeepDuplicateCheck) { ' (deep)' })"
     }
 
     $items = $sourceFolder.Items
@@ -855,12 +934,26 @@ function Restore-FolderRecursive {
             if ($existingKeys -or $runtimeDupKeys) {
                 $dupKey = Get-DuplicateKeyFromItem -item $item
                 if ($dupKey) {
+                    $isDup = $false
+                    $dupSource = $null
                     if ($existingKeys -and $existingKeys.Contains([string]$dupKey)) {
-                        $stats.Value.skipped++
-                        continue
+                        $isDup = $true
+                        $dupSource = "existing"
+                    } elseif ($runtimeDupKeys -and $runtimeDupKeys.Contains([string]$dupKey)) {
+                        $isDup = $true
+                        $dupSource = "batch"
                     }
-                    if ($runtimeDupKeys -and $runtimeDupKeys.Contains([string]$dupKey)) {
+                    if ($isDup) {
                         $stats.Value.skipped++
+                        $dupPayload = @{
+                            type = "dupSkipped"
+                            folder = $folderPath
+                            subject = (Get-SafeSubject $item)
+                            key = [string]$dupKey
+                            source = $dupSource
+                        }
+                        if ($Json) { Write-Output ($dupPayload | ConvertTo-Json -Compress -Depth 6) }
+                        else { Emit-Log "info" "Duplicado saltado [$dupSource]: $(Get-SafeSubject $item)" }
                         continue
                     }
                 }

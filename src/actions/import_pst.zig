@@ -70,7 +70,7 @@ pub fn run(session: Session, allocator: std.mem.Allocator) !u8 {
     }
 
     // 6) Saltar duplicados
-    const skip_dupes = input.confirm("\xc2\xbfSaltar duplicados (Message-Id/Search-Key)?", false);
+    const skip_dupes = input.confirm("\xc2\xbfSaltar duplicados (Message-Id/Search-Key + Asunto + Tamano en bytes)?", false);
 
     // 7) Resumen y confirmacion
     printSummary(session, pst_path, selected_folders, action, filter_year, filter_months, skip_dupes);
